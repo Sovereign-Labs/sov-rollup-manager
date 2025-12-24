@@ -14,7 +14,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 
-use sov_rollup_manager::{ManagerConfig, RollupVersion};
+use sov_rollup_manager::{HeightCheckMode, ManagerConfig, RollupVersion, run_with_options};
 
 /// Minimal representation of rollup config for extracting storage path.
 #[derive(Debug, Deserialize)]
@@ -39,6 +39,9 @@ pub struct TestCase {
     pub repo_url: String,
     /// The versions to run through, in order.
     pub versions: Vec<VersionSpec>,
+    /// Extra blocks to run after resync completes on the last version.
+    /// This helps verify the rollup can continue producing blocks after resyncing.
+    pub extra_blocks_after_resync: u64,
 }
 
 /// Internal struct for deserializing test_case.toml (without name field).
@@ -46,7 +49,14 @@ pub struct TestCase {
 struct TestCaseFile {
     /// Optional repository URL override.
     repo_url: Option<String>,
+    /// Extra blocks to run after resync (defaults to 10).
+    #[serde(default = "default_extra_resync_blocks")]
+    extra_blocks_after_resync: u64,
     versions: Vec<VersionSpec>,
+}
+
+fn default_extra_resync_blocks() -> u64 {
+    10
 }
 
 /// Specification for a single rollup version in a test case.
@@ -86,6 +96,7 @@ pub fn load_test_case(test_case_dir: &Path) -> Result<TestCase, LoadTestCaseErro
         name,
         repo_url: file.repo_url.unwrap_or_else(|| DEFAULT_REPO_URL.to_string()),
         versions: file.versions,
+        extra_blocks_after_resync: file.extra_blocks_after_resync,
     })
 }
 
@@ -296,6 +307,13 @@ pub fn run_test_case(
 ) -> Result<(), TestCaseError> {
     info!(name = %test_case.name, repo_url = %test_case.repo_url, "Running test case");
 
+    // Validate that the last version has a stop_height - test cases must be bounded
+    if let Some(last_version) = test_case.versions.last() {
+        if last_version.stop_height.is_none() {
+            return Err(TestCaseError::LastVersionMissingStopHeight);
+        }
+    }
+
     // Create builder with the test case's repo URL
     let builder = RollupBuilder::with_repo_url(cache_dir.to_path_buf(), test_case.repo_url.clone());
 
@@ -372,11 +390,24 @@ pub fn run_test_case(
     info!(name = %test_case.name, "Initial run completed successfully");
 
     // Resync test: clear storage and re-run (DA data persists in run_dir)
-    info!(name = %test_case.name, "Starting resync test");
+    // Use lenient height checking since fast resyncs may exit before we can poll the final height.
+    // Also extend the last version's stop height by extra_resync_blocks to verify continued operation.
+    info!(
+        name = %test_case.name,
+        extra_blocks = test_case.extra_blocks_after_resync,
+        "Starting resync test"
+    );
+
+    let resync_config = build_resync_config(&config, test_case.extra_blocks_after_resync);
 
     run_with_working_dir(&run_dir, || {
         clear_storage_dir(&storage_path)?;
-        sov_rollup_manager::run(&config, &extra_args).map_err(TestCaseError::Runner)
+        run_with_options(
+            &resync_config,
+            &extra_args,
+            HeightCheckMode::LenientIntermediateOnly,
+        )
+        .map_err(TestCaseError::Runner)
     })?;
 
     info!(name = %test_case.name, "Resync test completed successfully");
@@ -386,6 +417,24 @@ pub fn run_test_case(
     info!(name = %test_case.name, "Cleaned up run directory");
 
     Ok(())
+}
+
+/// Build a modified config for resync testing.
+///
+/// Extends the last version's stop height by `extra_blocks` to verify
+/// the rollup can continue producing blocks after resyncing.
+fn build_resync_config(config: &ManagerConfig, extra_blocks: u64) -> ManagerConfig {
+    let mut resync_config = config.clone();
+
+    if extra_blocks > 0 {
+        if let Some(last_version) = resync_config.versions.last_mut() {
+            if let Some(stop) = last_version.stop_height {
+                last_version.stop_height = Some(stop + extra_blocks);
+            }
+        }
+    }
+
+    resync_config
 }
 
 /// Validate that all config files use the same storage path.
@@ -444,6 +493,9 @@ where
 
 #[derive(Debug, Error)]
 pub enum TestCaseError {
+    #[error("last version must have a stop_height defined (test cases must be bounded)")]
+    LastVersionMissingStopHeight,
+
     #[error("failed to build rollup: {0}")]
     Build(#[from] BuilderError),
 
