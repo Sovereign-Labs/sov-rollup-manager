@@ -1,0 +1,14 @@
+[package]
+name = "upgrade-simulator"
+description = "Framework for testing rollup upgrades using sov-rollup-manager."
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+sov-rollup-manager = { path = "../.." }
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"

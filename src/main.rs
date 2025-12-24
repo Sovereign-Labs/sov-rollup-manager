@@ -15,6 +15,10 @@ struct Cli {
     /// Path to the manager config file (JSON)
     #[arg(short, long)]
     config: PathBuf,
+
+    /// Additional arguments to pass to rollup binaries (after --)
+    #[arg(last = true)]
+    rollup_args: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -44,14 +48,14 @@ fn main() -> ExitCode {
 
         info!(
             version = i,
-            binary = %version.binary_path.display(),
+            binary = %version.rollup_binary.display(),
             start,
             stop,
             "Configured version"
         );
     }
 
-    if let Err(e) = run(&config) {
+    if let Err(e) = run(&config, &cli.rollup_args) {
         error!("Error running rollup versions: {e}");
         return ExitCode::FAILURE;
     }

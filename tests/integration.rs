@@ -41,7 +41,7 @@ fn test_single_version_no_heights() {
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
-            binary_path: mock_rollup_binary(),
+            rollup_binary: mock_rollup_binary(),
             config_path: rollup_config,
             migration_path: None,
             start_height: None,
@@ -49,7 +49,7 @@ fn test_single_version_no_heights() {
         }],
     };
 
-    run(&config).expect("runner should succeed");
+    run(&config, &[]).expect("runner should succeed");
 
     // Single version with no stop height: 0 + DEFAULT_BLOCK_ADVANCE
     assert_eq!(read_state_height(&state_file), DEFAULT_BLOCK_ADVANCE);
@@ -66,14 +66,14 @@ fn test_two_versions_with_upgrade() {
     let config = ManagerConfig {
         versions: vec![
             RollupVersion {
-                binary_path: mock_rollup_binary(),
+                rollup_binary: mock_rollup_binary(),
                 config_path: rollup_config_v1,
                 migration_path: None,
                 start_height: None,
                 stop_height: Some(100),
             },
             RollupVersion {
-                binary_path: mock_rollup_binary(),
+                rollup_binary: mock_rollup_binary(),
                 config_path: rollup_config_v2,
                 migration_path: None,
                 start_height: Some(101),
@@ -82,7 +82,7 @@ fn test_two_versions_with_upgrade() {
         ],
     };
 
-    run(&config).expect("runner should succeed");
+    run(&config, &[]).expect("runner should succeed");
 
     // v1: 0->100, v2: no stop so 100 + DEFAULT_BLOCK_ADVANCE
     assert_eq!(read_state_height(&state_file), 100 + DEFAULT_BLOCK_ADVANCE);
@@ -100,21 +100,21 @@ fn test_three_versions_chain() {
     let config = ManagerConfig {
         versions: vec![
             RollupVersion {
-                binary_path: mock_rollup_binary(),
+                rollup_binary: mock_rollup_binary(),
                 config_path: rollup_config_v1,
                 migration_path: None,
                 start_height: None,
                 stop_height: Some(50),
             },
             RollupVersion {
-                binary_path: mock_rollup_binary(),
+                rollup_binary: mock_rollup_binary(),
                 config_path: rollup_config_v2,
                 migration_path: None,
                 start_height: Some(51),
                 stop_height: Some(150),
             },
             RollupVersion {
-                binary_path: mock_rollup_binary(),
+                rollup_binary: mock_rollup_binary(),
                 config_path: rollup_config_v3,
                 migration_path: None,
                 start_height: Some(151),
@@ -123,7 +123,7 @@ fn test_three_versions_chain() {
         ],
     };
 
-    run(&config).expect("runner should succeed");
+    run(&config, &[]).expect("runner should succeed");
 
     // v1: 0->50, v2: 51->150, v3: no stop so 150 + DEFAULT_BLOCK_ADVANCE
     assert_eq!(read_state_height(&state_file), 150 + DEFAULT_BLOCK_ADVANCE);
@@ -141,7 +141,7 @@ fn test_start_height_mismatch_detected_by_rollup() {
     // v2 claims to start at 200, but state is at 100 (expects 101)
     let config = ManagerConfig {
         versions: vec![RollupVersion {
-            binary_path: mock_rollup_binary(),
+            rollup_binary: mock_rollup_binary(),
             config_path: rollup_config,
             migration_path: None,
             start_height: Some(200),
@@ -149,7 +149,7 @@ fn test_start_height_mismatch_detected_by_rollup() {
         }],
     };
 
-    let result = run(&config);
+    let result = run(&config, &[]);
     assert!(result.is_err(), "runner should fail due to height mismatch");
 }
 
@@ -162,7 +162,7 @@ fn test_rollup_failure_propagates_to_manager() {
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
-            binary_path: mock_rollup_binary(),
+            rollup_binary: mock_rollup_binary(),
             config_path: nonexistent_config,
             migration_path: None,
             start_height: None,
@@ -170,7 +170,7 @@ fn test_rollup_failure_propagates_to_manager() {
         }],
     };
 
-    let result = run(&config);
+    let result = run(&config, &[]);
     assert!(
         matches!(result, Err(RunnerError::NonZeroExit { .. })),
         "runner should return NonZeroExit when rollup fails: {result:?}"

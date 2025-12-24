@@ -18,11 +18,11 @@ struct Cli {
 
     /// Block height at which to start processing (skips blocks before this)
     #[arg(long)]
-    start_at_height: Option<u64>,
+    start_at_rollup_height: Option<u64>,
 
     /// Block height at which to stop processing and exit
     #[arg(long)]
-    stop_at_height: Option<u64>,
+    stop_at_rollup_height: Option<u64>,
 }
 
 /// Minimal rollup config - just what we need for the mock.
@@ -56,7 +56,7 @@ fn run() -> Result<(), String> {
     info!(current_height, "Current state height");
 
     // Validate start_at_height if provided
-    if let Some(start_height) = cli.start_at_height {
+    if let Some(start_height) = cli.start_at_rollup_height {
         let expected = current_height + 1;
         if start_height != expected {
             return Err(format!(
@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
     }
 
     // Determine final height and update state
-    let final_height = if let Some(stop_height) = cli.stop_at_height {
+    let final_height = if let Some(stop_height) = cli.stop_at_rollup_height {
         info!(stop_height, "Will stop at height");
         stop_height
     } else {
@@ -93,10 +93,7 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    // Only initialize logging if RUST_LOG is set, keeping tests quiet by default
-    if std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::fmt::init();
-    }
+    tracing_subscriber::fmt::init();
 
     match run() {
         Ok(()) => ExitCode::SUCCESS,

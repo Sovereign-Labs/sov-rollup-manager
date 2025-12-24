@@ -1,1 +1,3 @@
 /target
+/crates/upgrade-simulator/rollup-build-cache
+/crates/upgrade-simulator/test-cases/**/rollup-state

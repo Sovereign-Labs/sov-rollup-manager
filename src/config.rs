@@ -7,7 +7,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Deserialize)]
 pub struct RollupVersion {
     /// Path to the rollup binary for this version.
-    pub binary_path: PathBuf,
+    pub rollup_binary: PathBuf,
 
     /// Path to the rollup config file for this version.
     pub config_path: PathBuf,
@@ -150,7 +150,7 @@ mod tests {
 
     fn version(start: Option<u64>, stop: Option<u64>) -> RollupVersion {
         RollupVersion {
-            binary_path: PathBuf::from("/bin/rollup"),
+            rollup_binary: PathBuf::from("/bin/rollup"),
             config_path: PathBuf::from("/etc/rollup.toml"),
             migration_path: None,
             start_height: start,

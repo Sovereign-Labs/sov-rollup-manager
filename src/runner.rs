@@ -24,11 +24,13 @@ pub enum RunnerError {
 }
 
 /// Runs all rollup versions in sequence.
-pub fn run(config: &ManagerConfig) -> Result<(), RunnerError> {
+///
+/// `extra_args` are additional arguments passed to every rollup binary invocation.
+pub fn run(config: &ManagerConfig, extra_args: &[String]) -> Result<(), RunnerError> {
     for (i, version) in config.versions.iter().enumerate() {
         info!(
             version = i,
-            binary = %version.binary_path.display(),
+            binary = %version.rollup_binary.display(),
             "Starting version"
         );
 
@@ -39,10 +41,11 @@ pub fn run(config: &ManagerConfig) -> Result<(), RunnerError> {
         }
 
         // Build arguments for the rollup binary
-        let args = build_rollup_args(version);
+        let mut args = build_rollup_args(version);
+        args.extend(extra_args.iter().cloned());
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        run_binary(version.binary_path.to_str().unwrap(), &args_refs)?;
+        run_binary(version.rollup_binary.to_str().unwrap(), &args_refs)?;
 
         info!(version = i, "Version completed successfully");
     }
@@ -58,12 +61,12 @@ fn build_rollup_args(version: &RollupVersion) -> Vec<String> {
     ];
 
     if let Some(start) = version.start_height {
-        args.push("--start-at-height".to_string());
+        args.push("--start-at-rollup-height".to_string());
         args.push(start.to_string());
     }
 
     if let Some(stop) = version.stop_height {
-        args.push("--stop-at-height".to_string());
+        args.push("--stop-at-rollup-height".to_string());
         args.push(stop.to_string());
     }
 

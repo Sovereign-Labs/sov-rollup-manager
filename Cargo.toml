@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/mock-rollup"]
+members = ["crates/mock-rollup", "crates/upgrade-simulator"]
+default-members = ["."]
 
 [package]
 name = "sov-rollup-manager"
