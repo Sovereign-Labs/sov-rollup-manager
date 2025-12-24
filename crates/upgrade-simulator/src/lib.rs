@@ -4,15 +4,28 @@
 //! - Git repository cloning and checkout of specific commits
 //! - Building rollup binaries and caching them by commit hash
 //! - Constructing manager configs and running upgrade test cases
+//! - Resync testing: clearing state and replaying from DA data
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
 
+use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 
 use sov_rollup_manager::{ManagerConfig, RollupVersion};
+
+/// Minimal representation of rollup config for extracting storage path.
+#[derive(Debug, Deserialize)]
+struct RollupConfig {
+    storage: StorageConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageConfig {
+    path: PathBuf,
+}
 
 /// The default repository URL for the Sovereign SDK rollup starter.
 pub const DEFAULT_REPO_URL: &str = "https://github.com/Sovereign-Labs/rollup-starter";
@@ -217,7 +230,11 @@ impl RollupBuilder {
 /// Run a test case through the rollup manager.
 ///
 /// The config directory is derived as `{test_root}/{test_case.name}`.
-/// The working directory is changed to the test case root for the duration of the run.
+/// A temporary run directory is created for rollup state and DA data.
+///
+/// After a successful initial run, the storage directory is cleared and the test
+/// is re-run to verify resync functionality (replaying from DA data).
+/// The entire run directory is cleaned up on success.
 pub fn run_test_case(
     builder: &RollupBuilder,
     test_root: &Path,
@@ -230,8 +247,19 @@ pub fn run_test_case(
         .canonicalize()
         .map_err(|e| TestCaseError::InvalidTestCaseRoot(test_case_root.clone(), e))?;
 
-    // Build all required binaries (paths must be absolute since we change cwd)
+    // Create temporary run directory for rollup state and DA data
+    let run_dir = test_case_root.join("run-dir");
+    if run_dir.exists() {
+        fs::remove_dir_all(&run_dir)
+            .map_err(|e| TestCaseError::ClearRunDir(run_dir.clone(), e))?;
+    }
+    fs::create_dir_all(&run_dir).map_err(|e| TestCaseError::CreateRunDir(run_dir.clone(), e))?;
+    info!(run_dir = %run_dir.display(), "Created run directory");
+
+    // Build all required binaries and collect config paths
     let mut rollup_versions = Vec::new();
+    let mut config_paths = Vec::new();
+
     for (i, version_spec) in test_case.versions.iter().enumerate() {
         let binary_path = builder
             .get_binary(&version_spec.commit)
@@ -242,8 +270,13 @@ pub fn run_test_case(
 
         let config_path = test_case_root.join(format!("v{i}")).join("config.toml");
         if !config_path.exists() {
-            return Err(TestCaseError::ConfigNotFound(config_path));
+            return Err(TestCaseError::ConfigNotFound(config_path.clone()));
         }
+        let config_path = config_path
+            .canonicalize()
+            .map_err(|e| TestCaseError::InvalidConfigPath(config_path.clone(), e))?;
+
+        config_paths.push(config_path.clone());
 
         rollup_versions.push(RollupVersion {
             rollup_binary: binary_path,
@@ -253,6 +286,10 @@ pub fn run_test_case(
             stop_height: version_spec.stop_height,
         });
     }
+
+    // Extract and validate storage paths - all versions must use the same path
+    let storage_path = validate_storage_paths(&config_paths)?;
+    info!(storage_path = %storage_path.display(), "Validated storage path consistency");
 
     // Construct the manager config
     let config = ManagerConfig {
@@ -266,19 +303,86 @@ pub fn run_test_case(
         genesis_path.to_string_lossy().into_owned(),
     ];
 
-    // Change to test case root directory for the run
-    let original_dir = std::env::current_dir().map_err(TestCaseError::WorkingDir)?;
-    std::env::set_current_dir(&test_case_root).map_err(TestCaseError::WorkingDir)?;
+    // Run initial test from the run directory
+    run_with_working_dir(&run_dir, || {
+        // Create storage directory (relative path resolved from run_dir)
+        fs::create_dir_all(&storage_path)
+            .map_err(|e| TestCaseError::CreateStorageDir(storage_path.clone(), e))?;
 
-    let result = sov_rollup_manager::run(&config, &extra_args).map_err(TestCaseError::Runner);
+        sov_rollup_manager::run(&config, &extra_args).map_err(TestCaseError::Runner)
+    })?;
+
+    info!(name = %test_case.name, "Initial run completed successfully");
+
+    // Resync test: clear storage and re-run (DA data persists in run_dir)
+    info!(name = %test_case.name, "Starting resync test");
+
+    run_with_working_dir(&run_dir, || {
+        clear_storage_dir(&storage_path)?;
+        sov_rollup_manager::run(&config, &extra_args).map_err(TestCaseError::Runner)
+    })?;
+
+    info!(name = %test_case.name, "Resync test completed successfully");
+
+    // Clean up run directory on success
+    fs::remove_dir_all(&run_dir).map_err(|e| TestCaseError::ClearRunDir(run_dir.clone(), e))?;
+    info!(name = %test_case.name, "Cleaned up run directory");
+
+    Ok(())
+}
+
+/// Validate that all config files use the same storage path.
+fn validate_storage_paths(config_paths: &[PathBuf]) -> Result<PathBuf, TestCaseError> {
+    let mut first_path: Option<PathBuf> = None;
+
+    for (i, config_path) in config_paths.iter().enumerate() {
+        let storage_path = extract_storage_path(config_path)?;
+
+        match &first_path {
+            None => first_path = Some(storage_path),
+            Some(first) if first != &storage_path => {
+                return Err(TestCaseError::StoragePathMismatch {
+                    first: first.clone(),
+                    version: i,
+                    other: storage_path,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    first_path.ok_or_else(|| TestCaseError::ConfigNotFound(PathBuf::from("no configs provided")))
+}
+
+/// Clear the storage directory while preserving DA data files.
+fn clear_storage_dir(storage_path: &Path) -> Result<(), TestCaseError> {
+    info!(path = %storage_path.display(), "Clearing storage directory for resync");
+
+    // Remove the entire directory and recreate it
+    if storage_path.exists() {
+        fs::remove_dir_all(storage_path)
+            .map_err(|e| TestCaseError::ClearStorageDir(storage_path.to_path_buf(), e))?;
+    }
+    fs::create_dir_all(storage_path)
+        .map_err(|e| TestCaseError::CreateStorageDir(storage_path.to_path_buf(), e))?;
+
+    Ok(())
+}
+
+/// Run a closure with a temporary working directory change.
+fn run_with_working_dir<F, T>(dir: &Path, f: F) -> Result<T, TestCaseError>
+where
+    F: FnOnce() -> Result<T, TestCaseError>,
+{
+    let original_dir = std::env::current_dir().map_err(TestCaseError::WorkingDir)?;
+    std::env::set_current_dir(dir).map_err(TestCaseError::WorkingDir)?;
+
+    let result = f();
 
     // Restore original working directory
     let _ = std::env::set_current_dir(original_dir);
 
-    result?;
-
-    info!(name = %test_case.name, "Test case completed successfully");
-    Ok(())
+    result
 }
 
 #[derive(Debug, Error)]
@@ -292,12 +396,58 @@ pub enum TestCaseError {
     #[error("invalid binary path {0}: {1}")]
     InvalidBinaryPath(PathBuf, io::Error),
 
+    #[error("invalid config path {0}: {1}")]
+    InvalidConfigPath(PathBuf, io::Error),
+
     #[error("config file not found: {0}")]
     ConfigNotFound(PathBuf),
+
+    #[error("failed to read config {path}: {source}")]
+    ReadConfig { path: PathBuf, source: io::Error },
+
+    #[error("failed to parse config {path}: {source}")]
+    ParseConfig {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+
+    #[error("storage path mismatch: v0 uses {first}, but v{version} uses {other}")]
+    StoragePathMismatch {
+        first: PathBuf,
+        version: usize,
+        other: PathBuf,
+    },
+
+    #[error("failed to create run directory {0}: {1}")]
+    CreateRunDir(PathBuf, io::Error),
+
+    #[error("failed to clear run directory {0}: {1}")]
+    ClearRunDir(PathBuf, io::Error),
+
+    #[error("failed to create storage directory {0}: {1}")]
+    CreateStorageDir(PathBuf, io::Error),
+
+    #[error("failed to clear storage directory {0}: {1}")]
+    ClearStorageDir(PathBuf, io::Error),
 
     #[error("failed to change working directory: {0}")]
     WorkingDir(io::Error),
 
     #[error("rollup manager failed: {0}")]
     Runner(#[from] sov_rollup_manager::RunnerError),
+}
+
+/// Extract the storage path from a rollup config TOML file.
+fn extract_storage_path(config_path: &Path) -> Result<PathBuf, TestCaseError> {
+    let content = fs::read_to_string(config_path).map_err(|e| TestCaseError::ReadConfig {
+        path: config_path.to_path_buf(),
+        source: e,
+    })?;
+
+    let config: RollupConfig = toml::from_str(&content).map_err(|e| TestCaseError::ParseConfig {
+        path: config_path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(config.storage.path)
 }

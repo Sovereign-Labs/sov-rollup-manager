@@ -7,8 +7,10 @@ publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 sov-rollup-manager = { path = "../.." }
 tempfile = "3"
 thiserror = "2"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"

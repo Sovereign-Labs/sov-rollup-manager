@@ -538,9 +538,11 @@ name = "upgrade-simulator"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "serde",
  "sov-rollup-manager",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
