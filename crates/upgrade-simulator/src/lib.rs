@@ -33,14 +33,24 @@ pub const DEFAULT_REPO_URL: &str = "https://github.com/Sovereign-Labs/rollup-sta
 /// A test case definition specifying versions to upgrade through.
 #[derive(Debug, Clone)]
 pub struct TestCase {
-    /// Human-readable name for this test case (also used as subdirectory name under test_root).
+    /// Human-readable name for this test case (derived from subdirectory name).
     pub name: String,
+    /// Repository URL to clone (defaults to DEFAULT_REPO_URL).
+    pub repo_url: String,
     /// The versions to run through, in order.
     pub versions: Vec<VersionSpec>,
 }
 
+/// Internal struct for deserializing test_case.toml (without name field).
+#[derive(Debug, Deserialize)]
+struct TestCaseFile {
+    /// Optional repository URL override.
+    repo_url: Option<String>,
+    versions: Vec<VersionSpec>,
+}
+
 /// Specification for a single rollup version in a test case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VersionSpec {
     /// Git commit hash to build from.
     pub commit: String,
@@ -48,6 +58,50 @@ pub struct VersionSpec {
     pub start_height: Option<u64>,
     /// Stop height (None for last version).
     pub stop_height: Option<u64>,
+}
+
+/// Load a test case from a directory containing test_case.toml.
+///
+/// The test case name is derived from the directory name.
+pub fn load_test_case(test_case_dir: &Path) -> Result<TestCase, LoadTestCaseError> {
+    let name = test_case_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| LoadTestCaseError::InvalidDirName(test_case_dir.to_path_buf()))?
+        .to_string();
+
+    let toml_path = test_case_dir.join("test_case.toml");
+    let content = fs::read_to_string(&toml_path).map_err(|e| LoadTestCaseError::ReadFile {
+        path: toml_path.clone(),
+        source: e,
+    })?;
+
+    let file: TestCaseFile =
+        toml::from_str(&content).map_err(|e| LoadTestCaseError::ParseToml {
+            path: toml_path,
+            source: e,
+        })?;
+
+    Ok(TestCase {
+        name,
+        repo_url: file.repo_url.unwrap_or_else(|| DEFAULT_REPO_URL.to_string()),
+        versions: file.versions,
+    })
+}
+
+#[derive(Debug, Error)]
+pub enum LoadTestCaseError {
+    #[error("invalid directory name: {0}")]
+    InvalidDirName(PathBuf),
+
+    #[error("failed to read {path}: {source}")]
+    ReadFile { path: PathBuf, source: io::Error },
+
+    #[error("failed to parse {path}: {source}")]
+    ParseToml {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
 }
 
 /// Manages the rollup repository and binary builds.
@@ -236,11 +290,14 @@ impl RollupBuilder {
 /// is re-run to verify resync functionality (replaying from DA data).
 /// The entire run directory is cleaned up on success.
 pub fn run_test_case(
-    builder: &RollupBuilder,
+    cache_dir: &Path,
     test_root: &Path,
     test_case: &TestCase,
 ) -> Result<(), TestCaseError> {
-    info!(name = %test_case.name, "Running test case");
+    info!(name = %test_case.name, repo_url = %test_case.repo_url, "Running test case");
+
+    // Create builder with the test case's repo URL
+    let builder = RollupBuilder::with_repo_url(cache_dir.to_path_buf(), test_case.repo_url.clone());
 
     let test_case_root = test_root.join(&test_case.name);
     let test_case_root = test_case_root
