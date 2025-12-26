@@ -1,0 +1,22 @@
+# The rollup repository that will be checked out. Defaults to the rollup starter.
+# repo_url = "https://github.com/Sovereign-Labs/rollup-starter"
+
+# The versions of the rollup that will be built and tested, in order. See `README.md` on setting up
+# the folders with rollup configs for each version.
+# Height ranges must be contiguous.
+# **Unlike** a real rollup-manager config, the last version must have a stop height, as that defines
+# the end of the test.
+[[versions]]
+commit = "db39657a04295d659712b6384b9950c45922d5e4"
+stop_height = 10
+[[versions]]
+commit = "33c3f3899c8b8e0f4f8c125797f2748ffe02c0ab"
+start_height = 11
+stop_height = 15
+
+# The upgrade simulator will run the rollup twice, resetting the state but not the DA between each
+# run, testing resyncing across upgrades.
+# On the second run, it will edit the stop height to add `extra_blocks_after_resync` to test block
+# production after resync.
+# Defaults to 10. Uncomment to change.
+# extra_blocks_after_resync = 10

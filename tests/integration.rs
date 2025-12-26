@@ -1,20 +1,29 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::{fs, path::Path};
 
+use escargot::CargoBuild;
 use tempfile::TempDir;
 
 use mock_rollup::DEFAULT_BLOCK_ADVANCE;
 use sov_rollup_manager::{ManagerConfig, RollupVersion, RunnerError, run};
 
-fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
+/// Returns the path to the mock-rollup binary, building it if necessary.
+/// The result is cached so subsequent calls don't rebuild.
 fn mock_rollup_binary() -> PathBuf {
-    project_root()
-        .join("target")
-        .join("debug")
-        .join("mock-rollup")
+    static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    BINARY_PATH
+        .get_or_init(|| {
+            CargoBuild::new()
+                .package("mock-rollup")
+                .bin("mock-rollup")
+                .run()
+                .expect("failed to build mock-rollup")
+                .path()
+                .to_path_buf()
+        })
+        .clone()
 }
 
 /// Creates a rollup config TOML file that points to the given state file.
