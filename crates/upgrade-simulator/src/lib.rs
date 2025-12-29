@@ -5,16 +5,25 @@
 //! - Building rollup binaries and caching them by commit hash
 //! - Constructing manager configs and running upgrade test cases
 //! - Resync testing: clearing state and replaying from DA data
+//! - Soak testing: generating transaction load during upgrade tests
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use std::{fs, io};
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::info;
+use tokio::process::Child;
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
-use sov_rollup_manager::{HeightCheckMode, ManagerConfig, RollupVersion, run_with_options};
+use sov_rollup_manager::{
+    HeightCheckMode, ManagerConfig, RollupApiError, RollupVersion, RunnerError, parse_http_port,
+    run_with_options,
+};
 
 /// Minimal representation of rollup config for extracting storage path.
 #[derive(Debug, Deserialize)]
@@ -25,6 +34,22 @@ struct RollupConfig {
 #[derive(Debug, Deserialize)]
 struct StorageConfig {
     path: PathBuf,
+}
+
+/// Configuration for soak testing during upgrade simulation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoakTestingConfig {
+    /// Number of concurrent soak test workers (default: 5).
+    #[serde(default = "default_num_workers")]
+    pub num_workers: u32,
+    /// RNG salt for reproducibility (default: 0).
+    /// Use different salts when restarting to avoid transaction overlap.
+    #[serde(default)]
+    pub salt: u32,
+}
+
+fn default_num_workers() -> u32 {
+    5
 }
 
 /// The default repository URL for the Sovereign SDK rollup starter.
@@ -42,6 +67,9 @@ pub struct TestCase {
     /// Extra blocks to run after resync completes on the last version.
     /// This helps verify the rollup can continue producing blocks after resyncing.
     pub extra_blocks_after_resync: u64,
+    /// Optional soak testing configuration.
+    /// When present, generates transaction load during the upgrade test.
+    pub soak_testing: Option<SoakTestingConfig>,
 }
 
 /// Internal struct for deserializing test_case.toml (without name field).
@@ -52,6 +80,8 @@ struct TestCaseFile {
     /// Extra blocks to run after resync (defaults to 10).
     #[serde(default = "default_extra_resync_blocks")]
     extra_blocks_after_resync: u64,
+    /// Optional soak testing configuration.
+    soak_testing: Option<SoakTestingConfig>,
     versions: Vec<VersionSpec>,
 }
 
@@ -94,9 +124,12 @@ pub fn load_test_case(test_case_dir: &Path) -> Result<TestCase, LoadTestCaseErro
 
     Ok(TestCase {
         name,
-        repo_url: file.repo_url.unwrap_or_else(|| DEFAULT_REPO_URL.to_string()),
+        repo_url: file
+            .repo_url
+            .unwrap_or_else(|| DEFAULT_REPO_URL.to_string()),
         versions: file.versions,
         extra_blocks_after_resync: file.extra_blocks_after_resync,
+        soak_testing: file.soak_testing,
     })
 }
 
@@ -246,7 +279,7 @@ impl RollupBuilder {
 
         let output = Command::new("cargo")
             .current_dir(&repo_path)
-            .args(["build", "--release"])
+            .args(["build", "--release", "--features", "acceptance-testing"])
             .output()
             .map_err(|e| BuilderError::CargoBuild(e.to_string()))?;
 
@@ -257,10 +290,7 @@ impl RollupBuilder {
         }
 
         // Find and copy the binary
-        let built_binary = repo_path
-            .join("target")
-            .join("release")
-            .join("rollup");
+        let built_binary = repo_path.join("target").join("release").join("rollup");
 
         if !built_binary.exists() {
             return Err(BuilderError::BinaryNotFound(built_binary));
@@ -290,7 +320,224 @@ impl RollupBuilder {
         self.checkout(commit)?;
         self.build(commit)
     }
+
+    /// Get the path to the cached soak-test binary for a given commit.
+    fn soak_binary_cache_path(&self, commit: &str) -> PathBuf {
+        self.cache_dir
+            .join("binaries")
+            .join(commit)
+            .join("rollup-starter-soak-test")
+    }
+
+    /// Build the soak-test binary and cache it.
+    fn build_soak(&self, commit: &str) -> Result<PathBuf, BuilderError> {
+        let repo_path = self.repo_path();
+        let binary_cache = self.soak_binary_cache_path(commit);
+
+        info!(commit, "Building soak-test binary");
+
+        let output = Command::new("cargo")
+            .current_dir(&repo_path)
+            .args(["build", "--release", "-p", "rollup-starter-soak-test"])
+            .output()
+            .map_err(|e| BuilderError::CargoBuild(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(BuilderError::CargoBuild(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        // Find and copy the binary
+        let built_binary = repo_path
+            .join("target")
+            .join("release")
+            .join("rollup-starter-soak-test");
+
+        if !built_binary.exists() {
+            return Err(BuilderError::BinaryNotFound(built_binary));
+        }
+
+        // Create cache directory and copy binary
+        if let Some(parent) = binary_cache.parent() {
+            fs::create_dir_all(parent).map_err(BuilderError::CopyBinary)?;
+        }
+        fs::copy(&built_binary, &binary_cache).map_err(BuilderError::CopyBinary)?;
+
+        info!(path = %binary_cache.display(), "Cached soak-test binary");
+        Ok(binary_cache)
+    }
+
+    /// Get the soak-test binary for a specific commit, building if necessary.
+    pub fn get_soak_binary(&self, commit: &str) -> Result<PathBuf, BuilderError> {
+        let binary_cache = self.soak_binary_cache_path(commit);
+
+        if binary_cache.exists() {
+            info!(commit, path = %binary_cache.display(), "Using cached soak-test binary");
+            return Ok(binary_cache);
+        }
+
+        // Need to build - ensure repo is ready
+        self.ensure_repo()?;
+        self.checkout(commit)?;
+        self.build_soak(commit)
+    }
 }
+
+// =============================================================================
+// Async HTTP helpers for soak testing coordination
+// =============================================================================
+
+/// Wait for the rollup sequencer to be ready to accept transactions.
+///
+/// Polls `/sequencer/ready` endpoint until it returns a success response.
+/// This is an unbounded loop intended to be raced against manager completion
+/// via `tokio::select!`.
+async fn wait_for_sequencer_ready(api_url: &str) -> Result<(), TestCaseError> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/sequencer/ready", api_url);
+
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                // Returns null when ready
+                return Ok(());
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Poll rollup height until it reaches or exceeds the target height.
+///
+/// Uses async reqwest to query the rollup's height endpoint.
+/// This is an unbounded loop intended to be raced against manager completion
+/// via `tokio::select!`.
+async fn wait_for_height(port: u16, target: u64) -> Result<(), TestCaseError> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "http://localhost:{}/modules/chain-state/state/current-heights/",
+        port
+    );
+
+    loop {
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                // Response format: { "value": [rollup_height, visible_slot_number] }
+                if let Some(height) = json
+                    .get("value")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_u64())
+                {
+                    if height >= target {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Start a soak-test process with the given configuration.
+fn start_soak_process(
+    binary: &Path,
+    api_url: &str,
+    num_workers: u32,
+    salt: u32,
+) -> Result<Child, TestCaseError> {
+    tokio::process::Command::new(binary)
+        .args([
+            "--api-url",
+            api_url,
+            "--num-workers",
+            &num_workers.to_string(),
+            "--salt",
+            &salt.to_string(),
+        ])
+        .spawn()
+        .map_err(TestCaseError::SoakTestStartFailed)
+}
+
+/// Stop a running soak-test process gracefully.
+///
+/// Sends SIGTERM and waits for graceful shutdown (up to 10 seconds),
+/// then falls back to SIGKILL if necessary.
+///
+/// Returns an error if the process had already exited with a failure code
+/// before we tried to stop it (indicating an unexpected crash).
+async fn stop_soak_process(mut child: Child) -> Result<(), TestCaseError> {
+    // First check if the process already exited (before we send any signal)
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            // Process already exited - check if it was an error
+            if !status.success() {
+                let exit_code = status.code().unwrap_or(-1);
+                error!(
+                    exit_code,
+                    "Soak-test process exited with error before termination"
+                );
+                return Err(TestCaseError::SoakTestFailed { exit_code });
+            }
+            // Exited successfully on its own (unusual but ok)
+            return Ok(());
+        }
+        Ok(None) => {
+            // Process still running, proceed to stop it
+        }
+        Err(e) => {
+            warn!(?e, "Error checking soak-test process status");
+        }
+    }
+
+    let pid = match child.id() {
+        Some(id) => Pid::from_raw(id as i32),
+        None => return Ok(()), // Already exited
+    };
+
+    // Send SIGTERM for graceful shutdown
+    if let Err(e) = kill(pid, Signal::SIGTERM) {
+        warn!(?e, "Failed to send SIGTERM to soak-test process");
+    }
+
+    // Wait for graceful shutdown with timeout
+    match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                // Non-zero exit after SIGTERM is expected (signal termination)
+                info!(?status, "Soak-test process exited after SIGTERM");
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(?e, "Error waiting for soak-test process");
+        }
+        Err(_) => {
+            // Timeout - force kill
+            warn!("Soak-test process did not exit gracefully after 1s, sending SIGKILL");
+            let _ = kill(pid, Signal::SIGKILL);
+            let _ = child.wait().await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Stop a soak process if one is running.
+async fn stop_soak_process_if_running(
+    soak_process: &mut Option<Child>,
+) -> Result<(), TestCaseError> {
+    if let Some(child) = soak_process.take() {
+        stop_soak_process(child).await?;
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Test case execution
+// =============================================================================
 
 /// Run a test case through the rollup manager.
 ///
@@ -300,7 +547,10 @@ impl RollupBuilder {
 /// After a successful initial run, the storage directory is cleared and the test
 /// is re-run to verify resync functionality (replaying from DA data).
 /// The entire run directory is cleaned up on success.
-pub fn run_test_case(
+///
+/// If soak testing is configured, transaction load is generated alongside
+/// the rollup during the test.
+pub async fn run_test_case(
     cache_dir: &Path,
     test_root: &Path,
     test_case: &TestCase,
@@ -325,8 +575,7 @@ pub fn run_test_case(
     // Create temporary run directory for rollup state and DA data
     let run_dir = test_case_root.join("run-dir");
     if run_dir.exists() {
-        fs::remove_dir_all(&run_dir)
-            .map_err(|e| TestCaseError::ClearRunDir(run_dir.clone(), e))?;
+        fs::remove_dir_all(&run_dir).map_err(|e| TestCaseError::ClearRunDir(run_dir.clone(), e))?;
     }
     fs::create_dir_all(&run_dir).map_err(|e| TestCaseError::CreateRunDir(run_dir.clone(), e))?;
     info!(run_dir = %run_dir.display(), "Created run directory");
@@ -362,9 +611,33 @@ pub fn run_test_case(
         });
     }
 
+    // Build soak-test binaries and pair with stop heights if soak testing is enabled
+    // Each entry is (binary_path, stop_height)
+    let soak_versions: Option<Vec<(PathBuf, u64)>> = if test_case.soak_testing.is_some() {
+        let mut versions = Vec::new();
+        for version_spec in &test_case.versions {
+            let binary = builder
+                .get_soak_binary(&version_spec.commit)
+                .map_err(TestCaseError::Build)?;
+            let binary = binary
+                .canonicalize()
+                .map_err(|e| TestCaseError::InvalidBinaryPath(binary.clone(), e))?;
+            // All versions must have stop_height (validated earlier)
+            let stop_height = version_spec.stop_height.expect("stop_height validated");
+            versions.push((binary, stop_height));
+        }
+        Some(versions)
+    } else {
+        None
+    };
+
     // Extract and validate storage paths - all versions must use the same path
     let storage_path = validate_storage_paths(&config_paths)?;
     info!(storage_path = %storage_path.display(), "Validated storage path consistency");
+
+    // Extract HTTP port from the first config (for soak testing coordination)
+    let http_port = parse_http_port(&config_paths[0])?;
+    let api_url = format!("http://localhost:{}", http_port);
 
     // Construct the manager config
     let config = ManagerConfig {
@@ -378,14 +651,23 @@ pub fn run_test_case(
         genesis_path.to_string_lossy().into_owned(),
     ];
 
-    // Run initial test from the run directory
-    run_with_working_dir(&run_dir, || {
-        // Create storage directory (relative path resolved from run_dir)
-        fs::create_dir_all(&storage_path)
-            .map_err(|e| TestCaseError::CreateStorageDir(storage_path.clone(), e))?;
+    // Create storage directory (relative path resolved from run_dir)
+    let storage_in_run_dir = run_dir.join(&storage_path);
+    fs::create_dir_all(&storage_in_run_dir)
+        .map_err(|e| TestCaseError::CreateStorageDir(storage_in_run_dir.clone(), e))?;
 
-        sov_rollup_manager::run(&config, &extra_args).map_err(TestCaseError::Runner)
-    })?;
+    // Run initial test
+    run_manager_with_soak(
+        &config,
+        &extra_args,
+        HeightCheckMode::Strict,
+        &run_dir,
+        test_case.soak_testing.as_ref(),
+        soak_versions.as_deref(),
+        &api_url,
+        http_port,
+    )
+    .await?;
 
     info!(name = %test_case.name, "Initial run completed successfully");
 
@@ -400,15 +682,48 @@ pub fn run_test_case(
 
     let resync_config = build_resync_config(&config, test_case.extra_blocks_after_resync);
 
-    run_with_working_dir(&run_dir, || {
-        clear_storage_dir(&storage_path)?;
-        run_with_options(
-            &resync_config,
-            &extra_args,
-            HeightCheckMode::LenientIntermediateOnly,
-        )
-        .map_err(TestCaseError::Runner)
-    })?;
+    // Clear storage for resync
+    clear_storage_dir(&storage_in_run_dir)?;
+
+    // For resync, only run soak testing during extra blocks phase.
+    // During resync the rollup replays existing transactions and won't accept new ones
+    // until it catches up, so soak only runs during the extra blocks at the end.
+    let resync_soak_versions: Option<Vec<(PathBuf, u64)>> =
+        if test_case.extra_blocks_after_resync > 0 {
+            soak_versions.as_ref().map(|versions| {
+                let (last_binary, _) = versions.last().expect("has versions");
+                let extended_stop = resync_config
+                    .versions
+                    .last()
+                    .and_then(|v| v.stop_height)
+                    .expect("resync config has stop height");
+                vec![(last_binary.clone(), extended_stop)]
+            })
+        } else {
+            None
+        };
+
+    let resync_soak_config = if resync_soak_versions.is_some() {
+        test_case.soak_testing.clone().map(|mut c| {
+            let salt_increment = c.num_workers * test_case.versions.len() as u32;
+            c.salt += salt_increment;
+            c
+        })
+    } else {
+        None
+    };
+
+    run_manager_with_soak(
+        &resync_config,
+        &extra_args,
+        HeightCheckMode::LenientIntermediateOnly,
+        &run_dir,
+        resync_soak_config.as_ref(),
+        resync_soak_versions.as_deref(),
+        &api_url,
+        http_port,
+    )
+    .await?;
 
     info!(name = %test_case.name, "Resync test completed successfully");
 
@@ -417,6 +732,176 @@ pub fn run_test_case(
     info!(name = %test_case.name, "Cleaned up run directory");
 
     Ok(())
+}
+
+/// Run the rollup manager with optional soak testing coordination.
+///
+/// If `soak_versions` is provided, soak testing will run alongside the manager.
+/// Each entry is a `(binary_path, stop_height)` pair.
+async fn run_manager_with_soak(
+    config: &ManagerConfig,
+    extra_args: &[String],
+    height_check_mode: HeightCheckMode,
+    run_dir: &Path,
+    soak_config: Option<&SoakTestingConfig>,
+    soak_versions: Option<&[(PathBuf, u64)]>,
+    api_url: &str,
+    http_port: u16,
+) -> Result<(), TestCaseError> {
+    // Change to run directory for the manager
+    let original_dir = std::env::current_dir().map_err(TestCaseError::WorkingDir)?;
+    std::env::set_current_dir(run_dir).map_err(TestCaseError::WorkingDir)?;
+
+    let result = if let (Some(soak_cfg), Some(versions)) = (soak_config, soak_versions) {
+        run_manager_with_soak_inner(
+            config,
+            extra_args,
+            height_check_mode,
+            soak_cfg,
+            versions,
+            api_url,
+            http_port,
+        )
+        .await
+    } else {
+        // No soak testing - just run the manager
+        let config = config.clone();
+        let extra_args = extra_args.to_vec();
+        tokio::task::spawn_blocking(move || {
+            run_with_options(&config, &extra_args, height_check_mode)
+        })
+        .await
+        .map_err(TestCaseError::ManagerTaskPanic)?
+        .map_err(TestCaseError::Runner)
+    };
+
+    // Restore original working directory
+    let _ = std::env::set_current_dir(original_dir);
+
+    result
+}
+
+/// Inner implementation of soak testing coordination.
+///
+/// Runs the manager in a background task and coordinates soak-test workers
+/// alongside it, detecting version transitions via height polling.
+///
+/// Each entry in `soak_versions` is a `(binary_path, stop_height)` pair.
+async fn run_manager_with_soak_inner(
+    config: &ManagerConfig,
+    extra_args: &[String],
+    height_check_mode: HeightCheckMode,
+    soak_config: &SoakTestingConfig,
+    soak_versions: &[(PathBuf, u64)],
+    api_url: &str,
+    http_port: u16,
+) -> Result<(), TestCaseError> {
+    info!(
+        "Starting soak testing with {} workers across {} versions",
+        soak_config.num_workers,
+        soak_versions.len()
+    );
+
+    // Spawn manager in background
+    let config = config.clone();
+    let extra_args = extra_args.to_vec();
+    let mut manager_handle = tokio::task::spawn_blocking(move || {
+        run_with_options(&config, &extra_args, height_check_mode)
+    });
+
+    // Run soak coordinator
+    run_soak_coordinator(
+        soak_versions,
+        soak_config,
+        api_url,
+        http_port,
+        &mut manager_handle,
+    )
+    .await
+}
+
+/// Coordinate soak testing alongside the rollup manager.
+///
+/// Monitors height to detect version transitions, stopping and restarting
+/// soak workers at each transition point.
+///
+/// Each entry in `soak_versions` is a `(binary_path, stop_height)` pair.
+/// The number of entries must match the number of versions being run.
+async fn run_soak_coordinator(
+    soak_versions: &[(PathBuf, u64)],
+    config: &SoakTestingConfig,
+    api_url: &str,
+    http_port: u16,
+    manager_handle: &mut JoinHandle<Result<(), RunnerError>>,
+) -> Result<(), TestCaseError> {
+    let mut soak_process: Option<Child> = None;
+    let mut current_salt = config.salt;
+
+    for (idx, (binary, stop_height)) in soak_versions.iter().enumerate() {
+        // Wait for sequencer ready (or manager to fail)
+        tokio::select! {
+            biased;
+
+            result = &mut *manager_handle => {
+                // Manager completed (error or success)
+                stop_soak_process_if_running(&mut soak_process).await?;
+                return result
+                    .map_err(TestCaseError::ManagerTaskPanic)?
+                    .map_err(TestCaseError::Runner);
+            }
+            ready_result = wait_for_sequencer_ready(api_url) => {
+                ready_result?;
+            }
+        }
+
+        info!(
+            version = idx,
+            binary = %binary.display(),
+            stop_height,
+            salt = current_salt,
+            "Sequencer ready, starting soak workers"
+        );
+
+        // Start soak workers
+        soak_process = Some(start_soak_process(
+            binary,
+            api_url,
+            config.num_workers,
+            current_salt,
+        )?);
+
+        // Poll height until stop_height (or manager completes)
+        tokio::select! {
+            biased;
+
+            result = &mut *manager_handle => {
+                // Manager completed
+                stop_soak_process_if_running(&mut soak_process).await?;
+                return result
+                    .map_err(TestCaseError::ManagerTaskPanic)?
+                    .map_err(TestCaseError::Runner);
+            }
+            _ = wait_for_height(http_port, *stop_height) => {
+                info!(
+                    version = idx,
+                    stop_height,
+                    "Reached stop height, transitioning to next version"
+                );
+            }
+        }
+
+        // Stop soak workers before version transition
+        stop_soak_process_if_running(&mut soak_process).await?;
+        current_salt += config.num_workers; // Avoid tx overlap with new salt
+    }
+
+    // Wait for manager to finish
+    let result = manager_handle.await;
+    stop_soak_process_if_running(&mut soak_process).await?;
+
+    result
+        .map_err(TestCaseError::ManagerTaskPanic)?
+        .map_err(TestCaseError::Runner)
 }
 
 /// Build a modified config for resync testing.
@@ -476,6 +961,7 @@ fn clear_storage_dir(storage_path: &Path) -> Result<(), TestCaseError> {
 }
 
 /// Run a closure with a temporary working directory change.
+#[allow(dead_code)]
 fn run_with_working_dir<F, T>(dir: &Path, f: F) -> Result<T, TestCaseError>
 where
     F: FnOnce() -> Result<T, TestCaseError>,
@@ -543,7 +1029,19 @@ pub enum TestCaseError {
     WorkingDir(io::Error),
 
     #[error("rollup manager failed: {0}")]
-    Runner(#[from] sov_rollup_manager::RunnerError),
+    Runner(sov_rollup_manager::RunnerError),
+
+    #[error("failed to parse HTTP port from config: {0}")]
+    HttpPortParse(#[from] RollupApiError),
+
+    #[error("failed to start soak-test process: {0}")]
+    SoakTestStartFailed(io::Error),
+
+    #[error("soak-test process failed with exit code {exit_code}")]
+    SoakTestFailed { exit_code: i32 },
+
+    #[error("manager task panicked: {0}")]
+    ManagerTaskPanic(tokio::task::JoinError),
 }
 
 /// Extract the storage path from a rollup config TOML file.
@@ -553,10 +1051,11 @@ fn extract_storage_path(config_path: &Path) -> Result<PathBuf, TestCaseError> {
         source: e,
     })?;
 
-    let config: RollupConfig = toml::from_str(&content).map_err(|e| TestCaseError::ParseConfig {
-        path: config_path.to_path_buf(),
-        source: e,
-    })?;
+    let config: RollupConfig =
+        toml::from_str(&content).map_err(|e| TestCaseError::ParseConfig {
+            path: config_path.to_path_buf(),
+            source: e,
+        })?;
 
     Ok(config.storage.path)
 }

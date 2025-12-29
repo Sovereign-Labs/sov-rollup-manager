@@ -75,7 +75,7 @@ impl RollupApiClient {
 
         Self {
             client,
-            base_url: format!("http://localhost:{}", port),
+            base_url: format!("http://localhost:{port}"),
         }
     }
 
@@ -106,16 +106,16 @@ impl RollupApiClient {
 
 /// Parse the HTTP bind port from a rollup config file.
 pub fn parse_http_port(config_path: &Path) -> Result<u16, RollupApiError> {
-    let content =
-        std::fs::read_to_string(config_path).map_err(|e| RollupApiError::ReadConfig {
-            path: config_path.to_path_buf(),
-            source: e,
-        })?;
-
-    let config: RollupConfig = toml::from_str(&content).map_err(|e| RollupApiError::ParseConfig {
+    let content = std::fs::read_to_string(config_path).map_err(|e| RollupApiError::ReadConfig {
         path: config_path.to_path_buf(),
         source: e,
     })?;
+
+    let config: RollupConfig =
+        toml::from_str(&content).map_err(|e| RollupApiError::ParseConfig {
+            path: config_path.to_path_buf(),
+            source: e,
+        })?;
 
     Ok(config.runner.http_config.bind_port)
 }

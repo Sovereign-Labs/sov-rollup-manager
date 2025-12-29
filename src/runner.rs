@@ -58,7 +58,9 @@ pub enum RunnerError {
     #[error("rollup exited but height could not be determined (stop_height was {stop_height})")]
     UnknownExitHeight { stop_height: u64 },
 
-    #[error("rollup exited unexpectedly without a configured stop height (last known height: {last_known_height:?})")]
+    #[error(
+        "rollup exited unexpectedly without a configured stop height (last known height: {last_known_height:?})"
+    )]
     UnexpectedExit { last_known_height: Option<u64> },
 
     #[error(
@@ -207,18 +209,25 @@ fn run_version_with_monitoring(
     let api_client = RollupApiClient::from_config(&version.config_path)?;
 
     // Spawn the rollup process
-    let mut child = Command::new(binary_path)
-        .args(args)
-        .spawn()
-        .map_err(|e| RunnerError::Spawn {
-            path: binary_path.to_string(),
-            source: e,
-        })?;
+    let mut child =
+        Command::new(binary_path)
+            .args(args)
+            .spawn()
+            .map_err(|e| RunnerError::Spawn {
+                path: binary_path.to_string(),
+                source: e,
+            })?;
 
     info!(pid = child.id(), "Spawned rollup process");
 
     // Run the monitoring loop
-    let result = monitor_rollup(&mut child, &api_client, version.stop_height, binary_path, lenient);
+    let result = monitor_rollup(
+        &mut child,
+        &api_client,
+        version.stop_height,
+        binary_path,
+        lenient,
+    );
 
     // Ensure process is cleaned up on error
     if result.is_err() {
@@ -302,7 +311,12 @@ fn handle_process_exit(
     binary_path: &str,
     lenient: bool,
 ) -> Result<(), RunnerError> {
-    info!(?status, ?last_known_height, lenient, "Rollup process exited");
+    info!(
+        ?status,
+        ?last_known_height,
+        lenient,
+        "Rollup process exited"
+    );
 
     // If process exited with error, always propagate it
     if !status.success() {
@@ -320,9 +334,7 @@ fn handle_process_exit(
             ?last_known_height,
             "Rollup exited unexpectedly without a configured stop height"
         );
-        return Err(RunnerError::UnexpectedExit {
-            last_known_height,
-        });
+        return Err(RunnerError::UnexpectedExit { last_known_height });
     };
 
     // In lenient mode, skip strict height validation for successful exits
@@ -339,7 +351,10 @@ fn handle_process_exit(
 
     let Some(height) = last_known_height else {
         // We never got a height reading - this shouldn't happen normally
-        error!(stop_height = stop, "Rollup exited but height was never determined");
+        error!(
+            stop_height = stop,
+            "Rollup exited but height was never determined"
+        );
         return Err(RunnerError::UnknownExitHeight { stop_height: stop });
     };
 

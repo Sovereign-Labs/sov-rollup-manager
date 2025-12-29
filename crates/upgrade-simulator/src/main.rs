@@ -5,7 +5,7 @@ use std::{fs, io};
 use clap::Parser;
 use tracing::{error, info};
 
-use upgrade_simulator::{load_test_case, run_test_case, TestCase};
+use upgrade_simulator::{TestCase, load_test_case, run_test_case};
 
 #[derive(Parser)]
 #[command(name = "upgrade-simulator")]
@@ -28,7 +28,8 @@ struct Cli {
     all: bool,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -41,12 +42,18 @@ fn main() -> ExitCode {
 
     // Validate that either --all or --test-cases is specified
     if !cli.all && cli.test_cases.is_none() {
-        error!("No test cases specified! List test case names with `--test-cases` or specify `--all` to run all available tests.");
+        error!(
+            "No test cases specified! List test case names with `--test-cases` or specify `--all` to run all available tests."
+        );
         return ExitCode::FAILURE;
     }
 
     // Load test cases from test_root directory
-    let filter = if cli.all { None } else { cli.test_cases.as_deref() };
+    let filter = if cli.all {
+        None
+    } else {
+        cli.test_cases.as_deref()
+    };
     let test_cases = match load_test_cases(&cli.test_root, filter) {
         Ok(cases) => cases,
         Err(e) => {
@@ -67,7 +74,7 @@ fn main() -> ExitCode {
     info!(count = test_cases.len(), "Loaded test cases");
 
     for test_case in &test_cases {
-        if let Err(e) = run_test_case(&cli.cache_dir, &cli.test_root, test_case) {
+        if let Err(e) = run_test_case(&cli.cache_dir, &cli.test_root, test_case).await {
             error!(name = %test_case.name, error = %e, "Test case failed");
             return ExitCode::FAILURE;
         }
