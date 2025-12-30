@@ -57,6 +57,11 @@ fn main() -> ExitCode {
 
     if let Err(e) = run(&config, &cli.rollup_args) {
         error!("Error running rollup versions: {e}");
+
+        // Preserve the rollup's exit code if available
+        if let Some(code) = e.exit_code() {
+            return ExitCode::from(code as u8);
+        }
         return ExitCode::FAILURE;
     }
 

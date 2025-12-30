@@ -125,6 +125,7 @@
   "interchain_gas_paymaster": null,
   "merkle_tree_hook": null,
   "warp": null,
+  "state_consistency": null,
   "value_setter": null,
   "evm": {
     "accounts": [],

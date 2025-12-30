@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
+use signal_hook::iterator::Signals;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -80,6 +82,22 @@ pub enum RunnerError {
         signal: &'static str,
         source: nix::Error,
     },
+
+    #[error("failed to register signal handler: {0}")]
+    SignalRegistration(#[from] std::io::Error),
+}
+
+impl RunnerError {
+    /// Returns the exit code from the failed rollup process, if available.
+    ///
+    /// This is only available for `NonZeroExit` errors where the process
+    /// exited normally (not terminated by a signal).
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            RunnerError::NonZeroExit { status, .. } => status.code(),
+            _ => None,
+        }
+    }
 }
 
 /// Controls how strictly the runner validates rollup exit heights.
@@ -208,6 +226,9 @@ fn run_version_with_monitoring(
     // Create API client for height queries
     let api_client = RollupApiClient::from_config(&version.config_path)?;
 
+    // Register signal handlers for forwarding to child
+    let mut signals = Signals::new([SIGTERM, SIGQUIT, SIGHUP])?;
+
     // Spawn the rollup process
     let mut child =
         Command::new(binary_path)
@@ -224,6 +245,7 @@ fn run_version_with_monitoring(
     let result = monitor_rollup(
         &mut child,
         &api_client,
+        &mut signals,
         version.stop_height,
         binary_path,
         lenient,
@@ -241,13 +263,29 @@ fn run_version_with_monitoring(
 fn monitor_rollup(
     child: &mut Child,
     api_client: &RollupApiClient,
+    signals: &mut Signals,
     stop_height: Option<u64>,
     binary_path: &str,
     lenient: bool,
 ) -> Result<(), RunnerError> {
     let mut last_known_height: Option<u64> = None;
+    let pid = Pid::from_raw(child.id() as i32);
 
     loop {
+        // Check for signals to forward to the child process
+        for sig in signals.pending() {
+            let signal = match sig {
+                SIGTERM => Signal::SIGTERM,
+                SIGQUIT => Signal::SIGQUIT,
+                SIGHUP => Signal::SIGHUP,
+                _ => continue,
+            };
+            info!(?signal, "Forwarding signal to rollup process");
+            if let Err(e) = signal::kill(pid, signal) {
+                warn!(error = %e, ?signal, "Failed to forward signal");
+            }
+        }
+
         // Try to query height (may fail if API not ready or process crashed)
         match api_client.query_rollup_height() {
             Ok(height) => {

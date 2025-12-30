@@ -6,8 +6,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Timeout for individual HTTP requests to the rollup API.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Timeout for connect and read operations.
+const TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Minimal representation of rollup config for extracting HTTP port.
 #[derive(Debug, Deserialize)]
@@ -46,15 +46,12 @@ pub enum RollupApiError {
     },
 
     #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
-
-    #[error("failed to parse response: {0}")]
-    ParseResponse(reqwest::Error),
+    Request(#[from] ureq::Error),
 }
 
 /// Client for querying the rollup's HTTP API.
 pub struct RollupApiClient {
-    client: reqwest::blocking::Client,
+    agent: ureq::Agent,
     base_url: String,
 }
 
@@ -67,14 +64,14 @@ impl RollupApiClient {
 
     /// Create a new client with a known port.
     pub fn new(port: u16) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(Duration::from_secs(1))
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(TIMEOUT))
+            .timeout_recv_body(Some(TIMEOUT))
             .build()
-            .expect("failed to build HTTP client");
+            .new_agent();
 
         Self {
-            client,
+            agent,
             base_url: format!("http://localhost:{port}"),
         }
     }
@@ -88,12 +85,8 @@ impl RollupApiClient {
             self.base_url
         );
 
-        let response: ValueResponse<(u64, u64)> = self
-            .client
-            .get(&url)
-            .send()?
-            .json()
-            .map_err(RollupApiError::ParseResponse)?;
+        let response: ValueResponse<(u64, u64)> =
+            self.agent.get(&url).call()?.body_mut().read_json()?;
 
         Ok(response.value)
     }
