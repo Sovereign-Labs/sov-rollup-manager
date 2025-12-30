@@ -7,8 +7,8 @@ help: ## Display this help message
 lint:  ## cargo fmt, check and clippy.
 	## fmt first, because it's the cheapest
 	cargo fmt --all --check
-	cargo check --all-targets --all-features
-	cargo clippy --all-targets --all-features
+	cargo check --workspace --all-targets --all-features
+	cargo clippy --workspace --all-targets --all-features
 
 test:  ## Runs test suite using next test
 	@cargo nextest run --no-fail-fast --status-level skip --all-features

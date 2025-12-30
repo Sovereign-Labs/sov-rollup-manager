@@ -6,16 +6,21 @@
 # Height ranges must be contiguous.
 # **Unlike** a real rollup-manager config, the last version must have a stop height, as that defines
 # the end of the test.
+#
+# A good number of blocks to use depends on the finalization delay of the DA. With instant finalization,
+# the rollup will need to process 1-2 blocks at various times (to progress past genesis, to process the
+# stop height etc.) so 5-10 blocks per version is recommended to ensure the rollup has time to run normally.
+# The test case running time will be (total number of blocks) * (DA block time) + resync time (usually fast).
 [[versions]]
 commit = "ee34ebef6e2129823eabd6e970254a4193e61146"
 stop_height = 15
 [[versions]]
 commit = "ee34ebef6e2129823eabd6e970254a4193e61146"
 start_height = 16
-stop_height = 29
+stop_height = 25
 
 [soak_testing]
-num_workers = 1
+num_workers = 10
 
 # The upgrade simulator will run the rollup twice, resetting the state but not the DA between each
 # run, testing resyncing across upgrades.
