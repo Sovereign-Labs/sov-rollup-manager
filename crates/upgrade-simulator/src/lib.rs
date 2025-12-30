@@ -36,10 +36,6 @@ struct StorageConfig {
     path: PathBuf,
 }
 
-// =============================================================================
-// Test case execution
-// =============================================================================
-
 /// Run a test case through the rollup manager.
 ///
 /// The config directory is derived as `{test_root}/{test_case.name}`.

@@ -144,6 +144,14 @@ pub fn run_with_options(
             "Starting version"
         );
 
+        if is_last && version.stop_height.is_some() {
+            warn!(
+                stop_height = version.stop_height,
+                "Last version has a stop height configured. The rollup will exit \
+                 after this height is reached rather than running indefinitely."
+            );
+        }
+
         // Run migration if specified
         if let Some(ref migration_path) = version.migration_path {
             info!(migration = %migration_path.display(), "Running migration");

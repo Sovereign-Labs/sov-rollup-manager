@@ -1,12 +1,27 @@
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 use std::{fs, path::Path};
 
 use escargot::CargoBuild;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use tempfile::TempDir;
 
-use mock_rollup::DEFAULT_BLOCK_ADVANCE;
+use mock_rollup::{HttpConfig, RollupConfig, RunnerConfig, StateFile};
 use sov_rollup_manager::{ManagerConfig, RollupVersion, RunnerError, run};
+
+/// Allocate a free port by binding to port 0 and reading the assigned port.
+///
+/// The socket is closed when this function returns, freeing the port for use.
+/// This means there's a race condition if another process or test grabs the same port, but this is
+/// very unlikely in practice.
+fn allocate_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to ephemeral port");
+    listener.local_addr().unwrap().port()
+}
 
 /// Returns the path to the mock-rollup binary, building it if necessary.
 /// The result is cached so subsequent calls don't rebuild.
@@ -28,22 +43,46 @@ fn mock_rollup_binary() -> PathBuf {
 
 /// Creates a rollup config TOML file that points to the given state file.
 fn write_rollup_config(dir: &TempDir, name: &str, state_file: &Path) -> PathBuf {
+    write_rollup_config_ext(dir, name, state_file, None, None, None)
+}
+
+/// Creates a rollup config with optional test behavior overrides.
+fn write_rollup_config_ext(
+    dir: &TempDir,
+    name: &str,
+    state_file: &Path,
+    exit_code: Option<u8>,
+    override_stop_height: Option<u64>,
+    idle_time_ms: Option<u64>,
+) -> PathBuf {
     let config_path = dir.path().join(format!("{name}.toml"));
-    let content = format!("state_file = {:?}", state_file.to_string_lossy());
+    let config = RollupConfig {
+        state_file: state_file.to_path_buf(),
+        runner: RunnerConfig {
+            http_config: HttpConfig {
+                bind_port: allocate_port(),
+            },
+        },
+        exit_code,
+        override_stop_height,
+        idle_time_ms,
+    };
+    let content = toml::to_string(&config).expect("failed to serialize config");
     fs::write(&config_path, content).expect("failed to write rollup config");
     config_path
 }
 
+fn read_state_file(state_file: &PathBuf) -> StateFile {
+    let content = fs::read_to_string(state_file).expect("state file should exist");
+    serde_json::from_str(&content).expect("state file should be valid JSON")
+}
+
 fn read_state_height(state_file: &PathBuf) -> u64 {
-    fs::read_to_string(state_file)
-        .expect("state file should exist")
-        .trim()
-        .parse()
-        .expect("state file should contain a number")
+    read_state_file(state_file).height
 }
 
 #[test]
-fn test_single_version_no_heights() {
+fn test_single_version_with_stop_height() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let state_file = temp_dir.path().join("state");
     let rollup_config = write_rollup_config(&temp_dir, "v1", &state_file);
@@ -54,14 +93,13 @@ fn test_single_version_no_heights() {
             config_path: rollup_config,
             migration_path: None,
             start_height: None,
-            stop_height: None,
+            stop_height: Some(100),
         }],
     };
 
     run(&config, &[]).expect("runner should succeed");
 
-    // Single version with no stop height: 0 + DEFAULT_BLOCK_ADVANCE
-    assert_eq!(read_state_height(&state_file), DEFAULT_BLOCK_ADVANCE);
+    assert_eq!(read_state_height(&state_file), 100);
 }
 
 #[test]
@@ -86,15 +124,15 @@ fn test_two_versions_with_upgrade() {
                 config_path: rollup_config_v2,
                 migration_path: None,
                 start_height: Some(101),
-                stop_height: None,
+                stop_height: Some(200),
             },
         ],
     };
 
     run(&config, &[]).expect("runner should succeed");
 
-    // v1: 0->100, v2: no stop so 100 + DEFAULT_BLOCK_ADVANCE
-    assert_eq!(read_state_height(&state_file), 100 + DEFAULT_BLOCK_ADVANCE);
+    // v1: 0->100, v2: 101->200
+    assert_eq!(read_state_height(&state_file), 200);
 }
 
 #[test]
@@ -127,15 +165,15 @@ fn test_three_versions_chain() {
                 config_path: rollup_config_v3,
                 migration_path: None,
                 start_height: Some(151),
-                stop_height: None,
+                stop_height: Some(250),
             },
         ],
     };
 
     run(&config, &[]).expect("runner should succeed");
 
-    // v1: 0->50, v2: 51->150, v3: no stop so 150 + DEFAULT_BLOCK_ADVANCE
-    assert_eq!(read_state_height(&state_file), 150 + DEFAULT_BLOCK_ADVANCE);
+    // v1: 0->50, v2: 51->150, v3: 151->250
+    assert_eq!(read_state_height(&state_file), 250);
 }
 
 #[test]
@@ -154,7 +192,7 @@ fn test_start_height_mismatch_detected_by_rollup() {
             config_path: rollup_config,
             migration_path: None,
             start_height: Some(200),
-            stop_height: None,
+            stop_height: Some(300),
         }],
     };
 
@@ -162,17 +200,112 @@ fn test_start_height_mismatch_detected_by_rollup() {
     assert!(result.is_err(), "runner should fail due to height mismatch");
 }
 
-#[test]
-fn test_rollup_failure_propagates_to_manager() {
+fn test_rollup_failure(rollup_exit_at: Option<u64>) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
 
-    // Point to a non-existent config file - rollup should fail to start
-    let nonexistent_config = temp_dir.path().join("does_not_exist.toml");
+    // Create a config that tells the mock rollup to exit with code 42
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, Some(42), rollup_exit_at, None);
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
             rollup_binary: mock_rollup_binary(),
-            config_path: nonexistent_config,
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+
+    let result = run(&config, &[]);
+    let err = result.expect_err("runner should fail when rollup exits with non-zero code");
+    assert!(
+        matches!(err, RunnerError::NonZeroExit { .. }),
+        "runner should return NonZeroExit: {err:?}"
+    );
+    assert_eq!(
+        err.exit_code(),
+        Some(42),
+        "exit code should match rollup's configured exit code"
+    );
+}
+
+#[test]
+fn test_rollup_failure_at_stop_height() {
+    test_rollup_failure(None);
+}
+
+#[test]
+fn test_rollup_failure_before_stop_height() {
+    test_rollup_failure(Some(20));
+}
+
+#[test]
+fn test_rollup_exits_early_with_success() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // Rollup will exit at height 50 (success), but manager expects it to run until 100
+    let rollup_config = write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None);
+
+    let config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+
+    let result = run(&config, &[]);
+    let err = result.expect_err("runner should fail when rollup exits before stop height");
+    assert!(
+        matches!(err, RunnerError::PrematureExit { .. }),
+        "runner should return PrematureExit: {err:?}"
+    );
+}
+
+#[test]
+fn test_rollup_exceeds_stop_height() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // Rollup will continue to height 150, but manager expects it to stop at 100
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(150), None);
+
+    let config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+
+    let result = run(&config, &[]);
+    let err = result.expect_err("runner should fail when rollup exceeds stop height");
+    assert!(
+        matches!(err, RunnerError::ExceededStopHeight { .. }),
+        "runner should return ExceededStopHeight: {err:?}"
+    );
+}
+
+#[test]
+fn test_rollup_exits_unexpectedly() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // Rollup will exit at height 50, but manager has no stop height (expects indefinite run)
+    let rollup_config = write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None);
+
+    let config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
             migration_path: None,
             start_height: None,
             stop_height: None,
@@ -180,8 +313,97 @@ fn test_rollup_failure_propagates_to_manager() {
     };
 
     let result = run(&config, &[]);
+    let err = result.expect_err("runner should fail when rollup exits unexpectedly");
     assert!(
-        matches!(result, Err(RunnerError::NonZeroExit { .. })),
-        "runner should return NonZeroExit when rollup fails: {result:?}"
+        matches!(err, RunnerError::UnexpectedExit { .. }),
+        "runner should return UnexpectedExit: {err:?}"
+    );
+}
+
+/// Returns the path to the rollup-manager binary, building it if necessary.
+fn manager_binary() -> PathBuf {
+    static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    BINARY_PATH
+        .get_or_init(|| {
+            CargoBuild::new()
+                .package("sov-rollup-manager")
+                .bin("sov-rollup-manager")
+                .run()
+                .expect("failed to build sov-rollup-manager")
+                .path()
+                .to_path_buf()
+        })
+        .clone()
+}
+
+#[test]
+fn test_signal_forwarding() {
+    use std::process::{Command, Stdio};
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // Configure the rollup to idle for a couple of seconds, giving us time to send signals
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, Some(1_000));
+
+    // Write manager config
+    let manager_config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+    let manager_config_path = temp_dir.path().join("manager.json");
+    let manager_config_content =
+        serde_json::to_string(&manager_config).expect("failed to serialize manager config");
+    fs::write(&manager_config_path, manager_config_content)
+        .expect("failed to write manager config");
+
+    // Spawn the manager as a subprocess
+    let mut child = Command::new(manager_binary())
+        .args(["-c", manager_config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn manager");
+
+    let manager_pid = Pid::from_raw(child.id() as i32);
+
+    // Wait for the rollup to start and begin idling
+    thread::sleep(Duration::from_millis(500));
+
+    // Send signals to the manager (which should forward them to the rollup)
+    signal::kill(manager_pid, Signal::SIGHUP).expect("failed to send SIGHUP");
+    thread::sleep(Duration::from_millis(100));
+
+    signal::kill(manager_pid, Signal::SIGQUIT).expect("failed to send SIGQUIT");
+    thread::sleep(Duration::from_millis(100));
+
+    signal::kill(manager_pid, Signal::SIGTERM).expect("failed to send SIGTERM");
+    thread::sleep(Duration::from_millis(100));
+
+    signal::kill(manager_pid, Signal::SIGHUP).expect("failed to send SIGHUP");
+
+    // Wait for the manager to exit
+    let status = child.wait().expect("failed to wait for manager");
+    assert!(status.success(), "manager should exit successfully");
+
+    // Check the state file for received signals
+    let state = read_state_file(&state_file);
+    assert_eq!(state.height, 100);
+
+    // Sort signals before comparing to avoid flakiness from race conditions
+    let mut actual_signals = state.signals;
+    actual_signals.sort();
+    let mut expected_signals = vec!["SIGHUP", "SIGHUP", "SIGQUIT", "SIGTERM"];
+    expected_signals.sort();
+    assert_eq!(
+        actual_signals, expected_signals,
+        "rollup should have received all forwarded signals"
     );
 }

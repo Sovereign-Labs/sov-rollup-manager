@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::{fs, thread, time::Duration};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use clap::Parser;
-use serde::Deserialize;
+use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
+use signal_hook::iterator::Signals;
+use tiny_http::{Response, Server};
 use tracing::{error, info};
 
-use mock_rollup::DEFAULT_BLOCK_ADVANCE;
+use mock_rollup::{DEFAULT_IDLE_TIME_MS, RollupConfig, StateFile};
 
 #[derive(Parser)]
 #[command(name = "mock-rollup")]
@@ -25,14 +30,16 @@ struct Cli {
     stop_at_rollup_height: Option<u64>,
 }
 
-/// Minimal rollup config - just what we need for the mock.
-#[derive(Debug, Deserialize)]
-struct RollupConfig {
-    /// Path to the state file that tracks the current block height.
-    state_file: PathBuf,
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        SIGTERM => "SIGTERM",
+        SIGQUIT => "SIGQUIT",
+        SIGHUP => "SIGHUP",
+        _ => "UNKNOWN",
+    }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<u8, String> {
     let cli = Cli::parse();
 
     // Load rollup config
@@ -41,18 +48,16 @@ fn run() -> Result<(), String> {
     let config: RollupConfig = toml::from_str(&config_content)
         .map_err(|e| format!("failed to parse rollup config: {e}"))?;
 
-    // Read current height from state file (0 if doesn't exist)
-    let current_height: u64 = if config.state_file.exists() {
+    // Read current state from state file (default if doesn't exist)
+    let mut state: StateFile = if config.state_file.exists() {
         let content = fs::read_to_string(&config.state_file)
             .map_err(|e| format!("failed to read state file: {e}"))?;
-        content
-            .trim()
-            .parse()
-            .map_err(|e| format!("failed to parse state file: {e}"))?
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse state file: {e}"))?
     } else {
-        0
+        StateFile::default()
     };
 
+    let current_height = state.height;
     info!(current_height, "Current state height");
 
     // Validate start_at_height if provided
@@ -68,35 +73,97 @@ fn run() -> Result<(), String> {
         info!("Starting from genesis");
     }
 
-    // Determine final height and update state
-    let final_height = if let Some(stop_height) = cli.stop_at_rollup_height {
+    // Determine final height (config override takes precedence over CLI)
+    let final_height = if let Some(override_height) = config.override_stop_height {
+        info!(
+            override_height,
+            cli_stop_height = ?cli.stop_at_rollup_height,
+            "Using override stop height from config (ignoring CLI)"
+        );
+        override_height
+    } else if let Some(stop_height) = cli.stop_at_rollup_height {
         info!(stop_height, "Will stop at height");
         stop_height
     } else {
-        // No stop height - simulate processing some blocks indefinitely
-        let new_height = current_height + DEFAULT_BLOCK_ADVANCE;
-        info!(new_height, "No stop height, advancing to");
-        new_height
+        return Err("Mock rollup was invoked with no stop height specified through either the CLI or the config. A stop height must be provided for the mock rollup to run. This is a bug in the test setup.".to_string());
     };
 
-    // Simulate block processing
-    thread::sleep(Duration::from_millis(100));
+    // Register signal handlers
+    let mut signals = Signals::new([SIGTERM, SIGQUIT, SIGHUP])
+        .map_err(|e| format!("failed to register signal handlers: {e}"))?;
+    let mut received_signals: Vec<String> = Vec::new();
 
-    // Write final height to state file
-    fs::write(&config.state_file, final_height.to_string())
+    // Start HTTP server for height queries
+    let bind_addr = format!("127.0.0.1:{}", config.runner.http_config.bind_port);
+    let server = Server::http(&bind_addr)
+        .map_err(|e| format!("failed to start HTTP server on {bind_addr}: {e}"))?;
+    info!(addr = %bind_addr, "HTTP server listening");
+
+    // Shared state for the current height (used by HTTP handler)
+    let height = Arc::new(AtomicU64::new(current_height));
+
+    // Spawn HTTP handler thread
+    let http_height = Arc::clone(&height);
+    let _http_thread = thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let url = request.url();
+            if url.starts_with("/modules/chain-state/state/current-heights") {
+                let h = http_height.load(Ordering::Relaxed);
+                // Response format: {"value": [rollup_height, visible_slot_number]}
+                let body = format!(r#"{{"value": [{h}, {h}]}}"#);
+                let response = Response::from_string(body)
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    )
+                    .with_status_code(200);
+                let _ = request.respond(response);
+            } else {
+                let response = Response::from_string("Not Found").with_status_code(404);
+                let _ = request.respond(response);
+            }
+        }
+    });
+
+    // Simulate block processing - jump to final height immediately
+    height.store(final_height, Ordering::Relaxed);
+
+    // Idle for configured time while checking for signals
+    let idle_time = Duration::from_millis(config.idle_time_ms.unwrap_or(DEFAULT_IDLE_TIME_MS));
+    let start = Instant::now();
+
+    while start.elapsed() < idle_time {
+        // Check for signals
+        for sig in signals.pending() {
+            let name = signal_name(sig);
+            info!(signal = name, "Received signal");
+            received_signals.push(name.to_string());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Update state with final height and received signals
+    state.height = final_height;
+    state.signals = received_signals;
+
+    // Write state file
+    let state_content =
+        serde_json::to_string(&state).map_err(|e| format!("failed to serialize state: {e}"))?;
+    fs::write(&config.state_file, state_content)
         .map_err(|e| format!("failed to write state file: {e}"))?;
 
-    info!(final_height, "Processed blocks, state now at height");
+    info!(final_height, signals = ?state.signals, "Processed blocks, state now at height");
     info!("Mock rollup shutting down gracefully");
 
-    Ok(())
+    Ok(config.exit_code.unwrap_or(0))
 }
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt::init();
 
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             error!("Error: {e}");
             ExitCode::FAILURE

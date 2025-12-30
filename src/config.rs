@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A single rollup version configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollupVersion {
     /// Path to the rollup binary for this version.
     pub rollup_binary: PathBuf,
@@ -23,13 +23,13 @@ pub struct RollupVersion {
     pub start_height: Option<u64>,
 
     /// The block height at which this version stops processing.
-    /// Must be None for the last version, required for all others.
+    /// Required for all versions except the last, optional for the last.
     #[serde(default)]
     pub stop_height: Option<u64>,
 }
 
 /// The top-level manager configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
     /// Ordered list of rollup versions, from oldest to newest.
     pub versions: Vec<RollupVersion>,
@@ -48,9 +48,6 @@ pub enum ConfigError {
 
     #[error("first version must not have a start_height")]
     FirstVersionHasStartHeight,
-
-    #[error("last version must not have a stop_height")]
-    LastVersionHasStopHeight,
 
     #[error("version {index} (0-indexed) is missing start_height")]
     MissingStartHeight { index: usize },
@@ -88,16 +85,10 @@ impl ManagerConfig {
         }
 
         let first = &self.versions[0];
-        let last = &self.versions[self.versions.len() - 1];
 
         // First version must not have start_height
         if first.start_height.is_some() {
             return Err(ConfigError::FirstVersionHasStartHeight);
-        }
-
-        // Last version must not have stop_height
-        if last.stop_height.is_some() {
-            return Err(ConfigError::LastVersionHasStopHeight);
         }
 
         // For single-version configs, we're done
@@ -204,14 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn last_with_stop_height_error() {
+    fn last_with_stop_height_valid() {
+        // Last version is allowed to have a stop_height
         let config = ManagerConfig {
             versions: vec![version(None, Some(100)), version(Some(101), Some(200))],
         };
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::LastVersionHasStopHeight)
-        ));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
