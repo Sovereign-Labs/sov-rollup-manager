@@ -88,6 +88,12 @@ fn run() -> Result<u8, String> {
         return Err("Mock rollup was invoked with no stop height specified through either the CLI or the config. A stop height must be provided for the mock rollup to run. This is a bug in the test setup.".to_string());
     };
 
+    // Match sovereign SDK behaviour
+    if final_height <= current_height {
+        info!(current_height, final_height, exit_code = ?config.exit_code, "Stop height was configued to be less than current state height - exiting with an error (unless exit code was overriden by config)");
+        return Ok(config.exit_code.unwrap_or(1));
+    }
+
     // Register signal handlers
     let mut signals = Signals::new([SIGTERM, SIGQUIT, SIGHUP])
         .map_err(|e| format!("failed to register signal handlers: {e}"))?;

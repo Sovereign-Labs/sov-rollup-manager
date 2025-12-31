@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing::{error, info};
 
-use sov_rollup_manager::{ManagerConfig, run};
+use sov_rollup_manager::{CheckpointConfig, ManagerConfig, run};
 
 #[derive(Parser)]
 #[command(name = "sov-rollup-manager")]
@@ -15,6 +15,16 @@ struct Cli {
     /// Path to the manager config file (JSON)
     #[arg(short, long)]
     config: PathBuf,
+
+    /// Path to the checkpoint file for tracking version progress.
+    /// Required unless --no-checkpoint-file is specified.
+    #[arg(long, required_unless_present = "no_checkpoint_file")]
+    checkpoint_file: Option<PathBuf>,
+
+    /// Disable checkpoint file usage. The manager will always start from version 0.
+    /// Use this only for testing or when you're certain you want to restart from scratch.
+    #[arg(long, conflicts_with = "checkpoint_file")]
+    no_checkpoint_file: bool,
 
     /// Additional arguments to pass to rollup binaries (after --)
     #[arg(last = true)]
@@ -55,7 +65,14 @@ fn main() -> ExitCode {
         );
     }
 
-    if let Err(e) = run(&config, &cli.rollup_args) {
+    // Build checkpoint config from CLI arguments
+    let checkpoint_config = if let Some(path) = cli.checkpoint_file {
+        CheckpointConfig::Enabled { path }
+    } else {
+        CheckpointConfig::Disabled
+    };
+
+    if let Err(e) = run(&config, &cli.rollup_args, checkpoint_config) {
         error!("Error running rollup versions: {e}");
 
         // Preserve the rollup's exit code if available

@@ -1,5 +1,6 @@
 //! Runner for executing rollup versions with height monitoring.
 
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
@@ -11,6 +12,9 @@ use signal_hook::iterator::Signals;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use crate::checkpoint::{
+    Checkpoint, CheckpointConfig, CheckpointError, load_checkpoint, write_checkpoint,
+};
 use crate::config::{ManagerConfig, RollupVersion};
 use crate::rollup_api::{RollupApiClient, RollupApiError};
 
@@ -85,6 +89,25 @@ pub enum RunnerError {
 
     #[error("failed to register signal handler: {0}")]
     SignalRegistration(#[from] std::io::Error),
+
+    #[error("failed to read checkpoint file: {0}")]
+    CheckpointRead(#[source] CheckpointError),
+
+    #[error("failed to write checkpoint file: {0}")]
+    CheckpointWrite(#[source] CheckpointError),
+
+    #[error("checkpoint version index {index} is out of bounds (config has {count} versions)")]
+    CheckpointIndexOutOfBounds { index: usize, count: usize },
+
+    #[error(
+        "checkpoint binary path mismatch at version {index}: \
+         checkpoint has {checkpoint_path}, config has {config_path}"
+    )]
+    CheckpointBinaryMismatch {
+        index: usize,
+        checkpoint_path: PathBuf,
+        config_path: PathBuf,
+    },
 }
 
 impl RunnerError {
@@ -121,8 +144,17 @@ pub enum HeightCheckMode {
 /// Runs all rollup versions in sequence.
 ///
 /// `extra_args` are additional arguments passed to every rollup binary invocation.
-pub fn run(config: &ManagerConfig, extra_args: &[String]) -> Result<(), RunnerError> {
-    run_with_options(config, extra_args, HeightCheckMode::Strict)
+pub fn run(
+    config: &ManagerConfig,
+    extra_args: &[String],
+    checkpoint_config: CheckpointConfig,
+) -> Result<(), RunnerError> {
+    run_with_options(
+        config,
+        extra_args,
+        HeightCheckMode::Strict,
+        checkpoint_config,
+    )
 }
 
 /// Runs all rollup versions in sequence with custom height checking mode.
@@ -132,11 +164,78 @@ pub fn run_with_options(
     config: &ManagerConfig,
     extra_args: &[String],
     height_check_mode: HeightCheckMode,
+    checkpoint_config: CheckpointConfig,
 ) -> Result<(), RunnerError> {
     let num_versions = config.versions.len();
 
+    // Load and validate checkpoint if enabled
+    let start_index = match &checkpoint_config {
+        CheckpointConfig::Enabled { path } => {
+            match load_checkpoint(path).map_err(RunnerError::CheckpointRead)? {
+                Some(checkpoint) => {
+                    // Validate checkpoint is within bounds
+                    if checkpoint.version_index >= num_versions {
+                        return Err(RunnerError::CheckpointIndexOutOfBounds {
+                            index: checkpoint.version_index,
+                            count: num_versions,
+                        });
+                    }
+
+                    // Validate binary path matches
+                    let config_binary = &config.versions[checkpoint.version_index].rollup_binary;
+                    if checkpoint.binary_path != *config_binary {
+                        return Err(RunnerError::CheckpointBinaryMismatch {
+                            index: checkpoint.version_index,
+                            checkpoint_path: checkpoint.binary_path,
+                            config_path: config_binary.clone(),
+                        });
+                    }
+
+                    info!(
+                        version_index = checkpoint.version_index,
+                        binary = %checkpoint.binary_path.display(),
+                        "Resuming from checkpoint"
+                    );
+                    checkpoint.version_index
+                }
+                None => {
+                    info!("No checkpoint file found, starting from version 0");
+                    0
+                }
+            }
+        }
+        CheckpointConfig::Disabled => {
+            info!("Checkpoint file disabled, starting from version 0");
+            0
+        }
+    };
+
     for (i, version) in config.versions.iter().enumerate() {
+        // Skip versions before the checkpoint
+        if i < start_index {
+            info!(
+                version = i,
+                binary = %version.rollup_binary.display(),
+                "Skipping already-completed version"
+            );
+            continue;
+        }
+
         let is_last = i == num_versions - 1;
+
+        // Write checkpoint before launching this version
+        if let CheckpointConfig::Enabled { path } = &checkpoint_config {
+            let checkpoint = Checkpoint {
+                version_index: i,
+                binary_path: version.rollup_binary.clone(),
+            };
+            write_checkpoint(path, &checkpoint).map_err(RunnerError::CheckpointWrite)?;
+            info!(
+                version = i,
+                checkpoint_file = %path.display(),
+                "Updated checkpoint file"
+            );
+        }
 
         info!(
             version = i,

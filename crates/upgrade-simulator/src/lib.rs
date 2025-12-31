@@ -16,7 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use sov_rollup_manager::{HeightCheckMode, ManagerConfig, parse_http_port, run_with_options};
+use sov_rollup_manager::{
+    CheckpointConfig, HeightCheckMode, ManagerConfig, parse_http_port, run_with_options,
+};
 use tracing::info;
 
 pub use builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
@@ -182,7 +184,12 @@ async fn run_manager_with_soak(
             let config = config.clone();
             let extra_args = extra_args.to_vec();
             let mut manager_handle = tokio::task::spawn_blocking(move || {
-                run_with_options(&config, &extra_args, height_check_mode)
+                run_with_options(
+                    &config,
+                    &extra_args,
+                    height_check_mode,
+                    CheckpointConfig::Disabled,
+                )
             });
 
             run_soak_coordinator(soak_cfg, api_url, &mut manager_handle).await
@@ -192,7 +199,12 @@ async fn run_manager_with_soak(
             let config = config.clone();
             let extra_args = extra_args.to_vec();
             tokio::task::spawn_blocking(move || {
-                run_with_options(&config, &extra_args, height_check_mode)
+                run_with_options(
+                    &config,
+                    &extra_args,
+                    height_check_mode,
+                    CheckpointConfig::Disabled,
+                )
             })
             .await
             .map_err(TestCaseError::ManagerTaskPanic)?
