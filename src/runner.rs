@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
+use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -334,7 +334,7 @@ fn run_version_with_monitoring(
     let api_client = RollupApiClient::from_config(&version.config_path)?;
 
     // Register signal handlers for forwarding to child
-    let mut signals = Signals::new([SIGTERM, SIGQUIT, SIGHUP])?;
+    let mut signals = Signals::new([SIGTERM, SIGQUIT])?;
 
     // Spawn the rollup process
     let mut child =
@@ -384,7 +384,6 @@ fn monitor_rollup(
             let signal = match sig {
                 SIGTERM => Signal::SIGTERM,
                 SIGQUIT => Signal::SIGQUIT,
-                SIGHUP => Signal::SIGHUP,
                 _ => continue,
             };
             info!(?signal, "Forwarding signal to rollup process");

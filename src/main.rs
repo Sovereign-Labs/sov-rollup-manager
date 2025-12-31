@@ -12,21 +12,23 @@ use sov_rollup_manager::{CheckpointConfig, ManagerConfig, run};
     about = "Manager for handling hard fork upgrades using multiple versioned rollup binaries"
 )]
 struct Cli {
-    /// Path to the manager config file (JSON)
+    /// Path to the manager config file (JSON); see README.md for the configuration format
     #[arg(short, long)]
     config: PathBuf,
 
-    /// Path to the checkpoint file for tracking version progress.
+    /// Path to the checkpoint file for tracking current rollup version across restarts.
     /// Required unless --no-checkpoint-file is specified.
-    #[arg(long, required_unless_present = "no_checkpoint_file")]
+    #[arg(short = 'f', long, required_unless_present = "no_checkpoint_file")]
     checkpoint_file: Option<PathBuf>,
 
-    /// Disable checkpoint file usage. The manager will always start from version 0.
-    /// Use this only for testing or when you're certain you want to restart from scratch.
+    /// Disable checkpoint file usage: the manager will always start from version 0 and will not
+    /// save the current version when running.
+    /// Do not use with a production rollup! Restarting a node from version 0 over existing
+    /// later-version state will fail to run.
     #[arg(long, conflicts_with = "checkpoint_file")]
     no_checkpoint_file: bool,
 
-    /// Additional arguments to pass to rollup binaries (after --)
+    /// Additional arguments to pass to rollup binaries
     #[arg(last = true)]
     rollup_args: Vec<String>,
 }

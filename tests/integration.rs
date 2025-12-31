@@ -439,16 +439,13 @@ fn test_signal_forwarding() {
     thread::sleep(Duration::from_millis(500));
 
     // Send signals to the manager (which should forward them to the rollup)
-    signal::kill(manager_pid, Signal::SIGHUP).expect("failed to send SIGHUP");
-    thread::sleep(Duration::from_millis(100));
-
     signal::kill(manager_pid, Signal::SIGQUIT).expect("failed to send SIGQUIT");
     thread::sleep(Duration::from_millis(100));
 
     signal::kill(manager_pid, Signal::SIGTERM).expect("failed to send SIGTERM");
     thread::sleep(Duration::from_millis(100));
 
-    signal::kill(manager_pid, Signal::SIGHUP).expect("failed to send SIGHUP");
+    signal::kill(manager_pid, Signal::SIGQUIT).expect("failed to send SIGHUP");
 
     // Wait for the manager to exit
     let status = child.wait().expect("failed to wait for manager");
@@ -461,7 +458,7 @@ fn test_signal_forwarding() {
     // Sort signals before comparing to avoid flakiness from race conditions
     let mut actual_signals = state.signals;
     actual_signals.sort();
-    let mut expected_signals = vec!["SIGHUP", "SIGHUP", "SIGQUIT", "SIGTERM"];
+    let mut expected_signals = vec!["SIGQUIT", "SIGQUIT", "SIGTERM"];
     expected_signals.sort();
     assert_eq!(
         actual_signals, expected_signals,
