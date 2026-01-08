@@ -2,15 +2,18 @@
 //!
 //! This module handles running soak-test workers alongside the rollup manager,
 //! coordinating version transitions based on height polling.
+//!
+//! For multi-node tests, soak testing only targets the master node since only
+//! the master can accept transactions. The soak coordinator receives a shutdown
+//! signal from the node runner when nodes complete or any node fails.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use sov_rollup_manager::RunnerError;
 use tokio::process::Child;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::error::TestCaseError;
@@ -127,6 +130,7 @@ pub fn start_soak_process(
             "--salt",
             &salt.to_string(),
         ])
+        .kill_on_drop(true)
         .spawn()
         .map_err(TestCaseError::SoakTestStartFailed)
 }
@@ -204,29 +208,39 @@ pub async fn stop_soak_process_if_running(
     Ok(())
 }
 
-/// Coordinate soak testing alongside the rollup manager.
+/// Coordinate soak testing alongside rollup nodes.
 ///
 /// Monitors height to detect version transitions, stopping and restarting
-/// soak workers at each transition point.
+/// soak workers at each transition point. The coordinator runs until either:
+/// - All versions complete their soak testing, or
+/// - A shutdown signal is received (indicating nodes completed or failed)
+///
+/// # Arguments
+/// * `soak_config` - Soak testing configuration with binaries and stop heights
+/// * `api_url` - The master node's API URL for height polling and transactions
+/// * `shutdown_rx` - Receiver for shutdown signal from node runner
+///
+/// # Returns
+/// * `Ok(())` - Soak testing completed or was cleanly shut down
+/// * `Err(_)` - Soak test worker failed
 pub async fn run_soak_coordinator(
     soak_config: &SoakManagerConfig,
     api_url: &str,
-    manager_handle: &mut JoinHandle<Result<(), RunnerError>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), TestCaseError> {
     let mut soak_process: Option<Child> = None;
     let mut current_salt = soak_config.config.salt;
 
     for (idx, (binary, stop_height)) in soak_config.versions.iter().enumerate() {
-        // Wait for sequencer ready (or manager to fail)
+        // Wait for sequencer ready (or shutdown signal)
         tokio::select! {
             biased;
 
-            result = &mut *manager_handle => {
-                // Manager completed (error or success)
+            _ = &mut shutdown_rx => {
+                // Nodes completed or failed - clean shutdown
+                info!("Received shutdown signal, stopping soak coordinator");
                 stop_soak_process_if_running(&mut soak_process).await?;
-                return result
-                    .map_err(TestCaseError::ManagerTaskPanic)?
-                    .map_err(TestCaseError::Runner);
+                return Ok(());
             }
             ready_result = wait_for_sequencer_ready(api_url) => {
                 ready_result?;
@@ -249,16 +263,15 @@ pub async fn run_soak_coordinator(
             current_salt,
         )?);
 
-        // Poll height until stop_height (or manager completes)
+        // Poll height until stop_height (or shutdown signal)
         tokio::select! {
             biased;
 
-            result = &mut *manager_handle => {
-                // Manager completed
+            _ = &mut shutdown_rx => {
+                // Nodes completed or failed - clean shutdown
+                info!("Received shutdown signal, stopping soak coordinator");
                 stop_soak_process_if_running(&mut soak_process).await?;
-                return result
-                    .map_err(TestCaseError::ManagerTaskPanic)?
-                    .map_err(TestCaseError::Runner);
+                return Ok(());
             }
             _ = wait_for_height(api_url, *stop_height) => {
                 info!(
@@ -274,11 +287,20 @@ pub async fn run_soak_coordinator(
         current_salt += soak_config.config.num_workers; // Avoid tx overlap with new salt
     }
 
-    // Wait for manager to finish
-    let result = manager_handle.await;
-    stop_soak_process_if_running(&mut soak_process).await?;
+    // All versions completed - wait briefly for shutdown signal or just finish
+    // The node runner will send shutdown when all nodes complete
+    info!("Soak testing completed all versions, waiting for nodes to finish");
 
-    result
-        .map_err(TestCaseError::ManagerTaskPanic)?
-        .map_err(TestCaseError::Runner)
+    // Give a small grace period for nodes to complete
+    tokio::select! {
+        _ = &mut shutdown_rx => {
+            info!("Received shutdown signal after soak completion");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            // Timeout - nodes may still be running, that's fine
+        }
+    }
+
+    stop_soak_process_if_running(&mut soak_process).await?;
+    Ok(())
 }

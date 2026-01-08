@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing::{error, info};
 
-use sov_rollup_manager::{CheckpointConfig, ManagerConfig, run};
+use sov_rollup_manager::{CheckpointConfig, DEFAULT_HEIGHT_SLACK, ManagerConfig, run};
 
 #[derive(Parser)]
 #[command(name = "sov-rollup-manager")]
@@ -27,6 +27,12 @@ struct Cli {
     /// later-version state will fail to run.
     #[arg(long, conflicts_with = "checkpoint_file")]
     no_checkpoint_file: bool,
+
+    /// Height monitoring slack in blocks. If the rollup exits within this many blocks of the
+    /// stop height, it's considered successful and the upgrade to the next version proceeds. This
+    /// handles fast resync scenarios where the rollup may exit before we can poll the final height.
+    #[arg(long, default_value_t = DEFAULT_HEIGHT_SLACK)]
+    height_slack: u64,
 
     /// Additional arguments to pass to rollup binaries
     #[arg(last = true)]
@@ -74,7 +80,12 @@ fn main() -> ExitCode {
         CheckpointConfig::Disabled
     };
 
-    if let Err(e) = run(&config, &cli.rollup_args, checkpoint_config) {
+    if let Err(e) = run(
+        &config,
+        &cli.rollup_args,
+        cli.height_slack,
+        checkpoint_config,
+    ) {
         error!("Error running rollup versions: {e}");
 
         // Preserve the rollup's exit code if available

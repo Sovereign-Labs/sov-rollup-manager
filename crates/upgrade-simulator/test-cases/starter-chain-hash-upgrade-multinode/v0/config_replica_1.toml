@@ -3,7 +3,7 @@ url = "{mock_da_url}"
 
 [storage]
 # The path to the rollup's data directory. Paths that do not begin with `/` are interpreted as relative paths.
-path = "./rollup-state/rollup-starter-data-mock"
+path = "./rollup-state/rollup-starter-data-mock-replica-2"
 user_commit_concurrency = 6
 kernel_commit_concurrency = 2
 # Disable pruning for now
@@ -25,11 +25,10 @@ da_polling_interval_ms = 200
 
 [runner.http_config]
 bind_host = "0.0.0.0"
-bind_port = 12346
-public_address = "http://127.0.0.1:12346"
+bind_port = 12357
 
 [monitoring]
-telegraf_address = "127.0.0.1:8094"
+telegraf_address = "127.0.0.1:8098"
 # Defines how many measurements a rollup node will accumulate before sending it to the Telegraf.
 # It is expected from the rollup node to produce metrics all the time,
 # so measurements are buffered by size and not sent by time.
@@ -69,12 +68,12 @@ ideal_lag_behind_finalized_slot = 1
 # This warms up caches so the main transaction executor can run with ready-to-use data.
 # This variable determines the number of worker threads.
 num_cache_warmup_workers = 0
-is_replica = false
+is_replica = true
 
 [sequencer.preferred.postgres_config]
 # If you have one available, uncomment the line below to use a postgres database for the sequencer's soft confirmations. This gives much better performance and durability.
 postgres_connection_string = "{postgres_connection_string}" 
-node_id = "node_1"
+node_id = "node_3"
 
 
 # [sequencer.preferred.rate_limiter] # Setting related to rate limiter.

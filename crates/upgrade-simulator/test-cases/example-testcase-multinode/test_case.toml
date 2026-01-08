@@ -1,0 +1,10 @@
+[[versions]]
+commit = "ee34ebef6e2129823eabd6e970254a4193e61146"
+stop_height = 15
+[[versions]]
+commit = "ee34ebef6e2129823eabd6e970254a4193e61146"
+start_height = 16
+stop_height = 25
+
+[soak_testing]
+num_workers = 10

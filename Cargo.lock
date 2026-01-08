@@ -1813,7 +1813,9 @@ name = "upgrade-simulator"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "escargot",
  "nix",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

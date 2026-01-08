@@ -113,7 +113,7 @@ fn test_single_version_with_stop_height() {
         }],
     };
 
-    run(&config, &[], CheckpointConfig::Disabled).expect("runner should succeed");
+    run(&config, &[], 0, CheckpointConfig::Disabled).expect("runner should succeed");
 
     assert_eq!(read_state_height(&state_file), 100);
 }
@@ -145,7 +145,7 @@ fn test_two_versions_with_upgrade() {
         ],
     };
 
-    run(&config, &[], CheckpointConfig::Disabled).expect("runner should succeed");
+    run(&config, &[], 0, CheckpointConfig::Disabled).expect("runner should succeed");
 
     // v1: 0->100, v2: 101->200
     assert_eq!(read_state_height(&state_file), 200);
@@ -180,7 +180,7 @@ fn test_version_that_stops_instantly() {
         ],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exits with non-zero code");
     assert!(
         matches!(err, RunnerError::NonZeroExit { .. }),
@@ -223,7 +223,7 @@ fn test_three_versions_chain() {
         ],
     };
 
-    run(&config, &[], CheckpointConfig::Disabled).expect("runner should succeed");
+    run(&config, &[], 0, CheckpointConfig::Disabled).expect("runner should succeed");
 
     // v1: 0->50, v2: 51->150, v3: 151->250
     assert_eq!(read_state_height(&state_file), 250);
@@ -249,7 +249,7 @@ fn test_start_height_mismatch_detected_by_rollup() {
         }],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exits with non-zero code");
     assert!(
         matches!(err, RunnerError::NonZeroExit { .. }),
@@ -275,7 +275,7 @@ fn test_rollup_failure(rollup_exit_at: Option<u64>) {
         }],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exits with non-zero code");
     assert!(
         matches!(err, RunnerError::NonZeroExit { .. }),
@@ -316,7 +316,7 @@ fn test_rollup_exits_early_with_success() {
         }],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exits before stop height");
     assert!(
         matches!(err, RunnerError::PrematureExit { .. }),
@@ -343,7 +343,7 @@ fn test_rollup_exceeds_stop_height() {
         }],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exceeds stop height");
     assert!(
         matches!(err, RunnerError::ExceededStopHeight { .. }),
@@ -369,7 +369,7 @@ fn test_rollup_exits_unexpectedly() {
         }],
     };
 
-    let result = run(&config, &[], CheckpointConfig::Disabled);
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
     let err = result.expect_err("runner should fail when rollup exits unexpectedly");
     assert!(
         matches!(err, RunnerError::UnexpectedExit { .. }),
@@ -508,6 +508,7 @@ fn test_checkpoint_enables_version_skip() {
     run(
         &config,
         &[],
+        0,
         CheckpointConfig::Enabled {
             path: checkpoint_file.clone(),
         },
@@ -549,6 +550,7 @@ fn test_checkpoint_binary_mismatch_error() {
     let result = run(
         &config,
         &[],
+        0,
         CheckpointConfig::Enabled {
             path: checkpoint_file,
         },
@@ -587,6 +589,7 @@ fn test_checkpoint_index_out_of_bounds_error() {
     let result = run(
         &config,
         &[],
+        0,
         CheckpointConfig::Enabled {
             path: checkpoint_file,
         },
@@ -630,6 +633,7 @@ fn test_checkpoint_written_before_each_version() {
     run(
         &config,
         &[],
+        0,
         CheckpointConfig::Enabled {
             path: checkpoint_file.clone(),
         },
@@ -690,6 +694,7 @@ fn test_checkpoint_restart_from_intermediate_version() {
     run(
         &config,
         &[],
+        0,
         CheckpointConfig::Enabled {
             path: checkpoint_file.clone(),
         },

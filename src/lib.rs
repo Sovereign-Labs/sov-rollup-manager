@@ -8,4 +8,4 @@ pub use checkpoint::{
 };
 pub use config::{ConfigError, ManagerConfig, RollupVersion};
 pub use rollup_api::{RollupApiClient, RollupApiError, parse_http_port};
-pub use runner::{HeightCheckMode, RunnerError, run, run_with_options};
+pub use runner::{DEFAULT_HEIGHT_SLACK, RunnerError, run};

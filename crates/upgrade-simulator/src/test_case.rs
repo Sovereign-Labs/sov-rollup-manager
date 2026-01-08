@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use crate::builder::{DEFAULT_REPO_URL, RollupBuilder};
 use crate::error::TestCaseError;
+use crate::node_config::{NodeConfig, TestNodeLayout};
+use crate::node_runner::NodeVersions;
 use crate::soak::SoakManagerConfig;
 
 /// Configuration for soak testing during upgrade simulation.
@@ -46,45 +48,6 @@ pub struct TestCase {
 }
 
 impl TestCase {
-    /// Build RollupVersions from the version specs.
-    ///
-    /// Each RollupVersion contains its config_path, so callers can extract
-    /// config paths with: `versions.iter().map(|v| &v.config_path).collect()`
-    pub fn build_rollup_versions(
-        &self,
-        builder: &RollupBuilder,
-        test_case_root: &Path,
-    ) -> Result<Vec<RollupVersion>, TestCaseError> {
-        let mut rollup_versions = Vec::new();
-
-        for (i, version_spec) in self.versions.iter().enumerate() {
-            let binary_path = builder
-                .get_binary(&version_spec.commit)
-                .map_err(TestCaseError::Build)?;
-            let binary_path = binary_path
-                .canonicalize()
-                .map_err(|e| TestCaseError::InvalidBinaryPath(binary_path.clone(), e))?;
-
-            let config_path = test_case_root.join(format!("v{i}")).join("config.toml");
-            if !config_path.exists() {
-                return Err(TestCaseError::ConfigNotFound(config_path.clone()));
-            }
-            let config_path = config_path
-                .canonicalize()
-                .map_err(|e| TestCaseError::InvalidConfigPath(config_path.clone(), e))?;
-
-            rollup_versions.push(RollupVersion {
-                rollup_binary: binary_path,
-                config_path,
-                migration_path: None,
-                start_height: version_spec.start_height,
-                stop_height: Some(version_spec.stop_height),
-            });
-        }
-
-        Ok(rollup_versions)
-    }
-
     /// Build soak manager config if soak testing is enabled.
     ///
     /// Returns `None` if soak testing is not configured.
@@ -110,6 +73,66 @@ impl TestCase {
         }
 
         Ok(Some(SoakManagerConfig::new(soak_config.clone(), versions)))
+    }
+
+    /// Build RollupVersions for all nodes based on detected layout.
+    ///
+    /// This builds versions for master and all replicas, using the config paths
+    /// detected by `detect_node_layout()`. Single-node tests (config.toml) are
+    /// just the degenerate case with empty replicas vec.
+    pub fn build_node_versions(
+        &self,
+        builder: &RollupBuilder,
+        layout: &TestNodeLayout,
+    ) -> Result<NodeVersions, TestCaseError> {
+        // Build versions for master
+        let master = self.build_versions_for_node(builder, &layout.master)?;
+
+        // Build versions for each replica
+        let replicas: Vec<Vec<RollupVersion>> = layout
+            .replicas
+            .iter()
+            .map(|node| self.build_versions_for_node(builder, node))
+            .collect::<Result<_, _>>()?;
+
+        Ok(NodeVersions { master, replicas })
+    }
+
+    /// Build RollupVersions for a single node.
+    ///
+    /// Uses the node's config paths (one per version) to construct RollupVersions.
+    fn build_versions_for_node(
+        &self,
+        builder: &RollupBuilder,
+        node: &NodeConfig,
+    ) -> Result<Vec<RollupVersion>, TestCaseError> {
+        let mut rollup_versions = Vec::new();
+
+        for (i, version_spec) in self.versions.iter().enumerate() {
+            // Get the binary for this version
+            let binary_path = builder
+                .get_binary(&version_spec.commit)
+                .map_err(TestCaseError::Build)?;
+            let binary_path = binary_path
+                .canonicalize()
+                .map_err(|e| TestCaseError::InvalidBinaryPath(binary_path.clone(), e))?;
+
+            // Get the config path for this node/version from the layout
+            let config_path = &node.config_paths[i];
+            let config_path = config_path
+                .canonicalize()
+                .map_err(|e| TestCaseError::InvalidConfigPath(config_path.clone(), e))?;
+
+            rollup_versions.push(RollupVersion {
+                rollup_binary: binary_path,
+                config_path,
+                migration_path: None,
+                start_height: version_spec.start_height,
+                stop_height: Some(version_spec.stop_height),
+            });
+        }
+
+        Ok(rollup_versions)
     }
 }
 

@@ -143,7 +143,13 @@ impl RollupBuilder {
 
         let output = Command::new("cargo")
             .current_dir(&repo_path)
-            .args(["build", "--release", "--features", "acceptance-testing"])
+            .args([
+                "build",
+                "--release",
+                "--no-default-features",
+                "--features",
+                "acceptance-testing,mock_da_external,mock_zkvm",
+            ])
             .output()
             .map_err(|e| BuilderError::CargoBuild(e.to_string()))?;
 
@@ -245,5 +251,77 @@ impl RollupBuilder {
         self.ensure_repo()?;
         self.checkout(commit)?;
         self.build_soak(commit)
+    }
+
+    /// Get the path to the cached mock-da-server binary for a given commit.
+    fn mock_da_binary_cache_path(&self, commit: &str) -> PathBuf {
+        self.cache_dir
+            .join("binaries")
+            .join(commit)
+            .join("mock-da-server")
+    }
+
+    /// Build the mock-da-server binary and cache it.
+    fn build_mock_da(&self, commit: &str) -> Result<PathBuf, BuilderError> {
+        let repo_path = self.repo_path();
+        let binary_cache = self.mock_da_binary_cache_path(commit);
+
+        info!(commit, "Building mock-da-server binary");
+
+        let output = Command::new("cargo")
+            .current_dir(&repo_path)
+            .args([
+                "build",
+                "--release",
+                "--bin",
+                "mock-da-server",
+                "--no-default-features",
+                "--features=mock_da_external,mock_zkvm",
+            ])
+            .output()
+            .map_err(|e| BuilderError::CargoBuild(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(BuilderError::CargoBuild(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        // Find and copy the binary
+        let built_binary = repo_path
+            .join("target")
+            .join("release")
+            .join("mock-da-server");
+
+        if !built_binary.exists() {
+            return Err(BuilderError::BinaryNotFound(built_binary));
+        }
+
+        // Create cache directory and copy binary
+        if let Some(parent) = binary_cache.parent() {
+            fs::create_dir_all(parent).map_err(BuilderError::CopyBinary)?;
+        }
+        fs::copy(&built_binary, &binary_cache).map_err(BuilderError::CopyBinary)?;
+
+        info!(path = %binary_cache.display(), "Cached mock-da-server binary");
+        Ok(binary_cache)
+    }
+
+    /// Get the mock-da-server binary for a specific commit, building if necessary.
+    ///
+    /// The mock-da-server is built with external DA features:
+    /// `--no-default-features --features=mock_da_external,mock_zkvm`
+    pub fn get_mock_da_binary(&self, commit: &str) -> Result<PathBuf, BuilderError> {
+        let binary_cache = self.mock_da_binary_cache_path(commit);
+
+        if binary_cache.exists() {
+            info!(commit, path = %binary_cache.display(), "Using cached mock-da-server binary");
+            return Ok(binary_cache);
+        }
+
+        // Need to build - ensure repo is ready
+        self.ensure_repo()?;
+        self.checkout(commit)?;
+        self.build_mock_da(commit)
     }
 }

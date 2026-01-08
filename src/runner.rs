@@ -69,15 +69,6 @@ pub enum RunnerError {
     )]
     UnexpectedExit { last_known_height: Option<u64> },
 
-    #[error(
-        "possible race condition: rollup exited at height {current_height}, \
-         one block before stop height {stop_height} - manual verification required"
-    )]
-    PossibleRaceCondition {
-        current_height: u64,
-        stop_height: u64,
-    },
-
     #[error("failed to terminate rollup process: {0}")]
     Terminate(std::io::Error),
 
@@ -123,47 +114,22 @@ impl RunnerError {
     }
 }
 
-/// Controls how strictly the runner validates rollup exit heights.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum HeightCheckMode {
-    /// Strict validation: error if the rollup exits before reaching stop height.
-    #[default]
-    Strict,
-
-    /// Lenient for intermediate versions, strict for the last version.
-    /// Useful for fast resync scenarios where intermediate versions may exit
-    /// before height can be polled, but the final version should be validated.
-    LenientIntermediateOnly,
-
-    /// Fully lenient: skip height validation for all versions on successful exit.
-    /// The runner will still error if a process exits with non-zero status or
-    /// if it detects the rollup exceeding the stop height while running.
-    Lenient,
-}
+/// Default slack for height monitoring (blocks).
+pub const DEFAULT_HEIGHT_SLACK: u64 = 10;
 
 /// Runs all rollup versions in sequence.
 ///
-/// `extra_args` are additional arguments passed to every rollup binary invocation.
+/// # Arguments
+/// * `config` - The manager configuration with version definitions
+/// * `extra_args` - Additional arguments passed to every rollup binary invocation
+/// * `height_slack` - Number of blocks before stop height that's still considered successful.
+///   This handles fast resync scenarios where the rollup may exit before we can poll
+///   the final height. Use `DEFAULT_HEIGHT_SLACK` for the recommended value.
+/// * `checkpoint_config` - Checkpoint file configuration
 pub fn run(
     config: &ManagerConfig,
     extra_args: &[String],
-    checkpoint_config: CheckpointConfig,
-) -> Result<(), RunnerError> {
-    run_with_options(
-        config,
-        extra_args,
-        HeightCheckMode::Strict,
-        checkpoint_config,
-    )
-}
-
-/// Runs all rollup versions in sequence with custom height checking mode.
-///
-/// `extra_args` are additional arguments passed to every rollup binary invocation.
-pub fn run_with_options(
-    config: &ManagerConfig,
-    extra_args: &[String],
-    height_check_mode: HeightCheckMode,
+    height_slack: u64,
     checkpoint_config: CheckpointConfig,
 ) -> Result<(), RunnerError> {
     let num_versions = config.versions.len();
@@ -261,15 +227,8 @@ pub fn run_with_options(
         let mut args = build_rollup_args(version);
         args.extend(extra_args.iter().cloned());
 
-        // Determine effective leniency for this version
-        let lenient = match height_check_mode {
-            HeightCheckMode::Strict => false,
-            HeightCheckMode::LenientIntermediateOnly => !is_last,
-            HeightCheckMode::Lenient => true,
-        };
-
         // Run the rollup with height monitoring
-        run_version_with_monitoring(version, &args, lenient)?;
+        run_version_with_monitoring(version, &args, height_slack)?;
 
         info!(version = i, "Version completed successfully");
     }
@@ -326,7 +285,7 @@ fn run_migration(path: &str) -> Result<(), RunnerError> {
 fn run_version_with_monitoring(
     version: &RollupVersion,
     args: &[String],
-    lenient: bool,
+    height_slack: u64,
 ) -> Result<(), RunnerError> {
     let binary_path = version.rollup_binary.to_str().unwrap();
 
@@ -355,7 +314,7 @@ fn run_version_with_monitoring(
         &mut signals,
         version.stop_height,
         binary_path,
-        lenient,
+        height_slack,
     );
 
     // Ensure process is cleaned up on error
@@ -373,7 +332,7 @@ fn monitor_rollup(
     signals: &mut Signals,
     stop_height: Option<u64>,
     binary_path: &str,
-    lenient: bool,
+    height_slack: u64,
 ) -> Result<(), RunnerError> {
     let mut last_known_height: Option<u64> = None;
     let pid = Pid::from_raw(child.id() as i32);
@@ -429,7 +388,7 @@ fn monitor_rollup(
                     last_known_height,
                     stop_height,
                     binary_path,
-                    lenient,
+                    height_slack,
                 );
             }
             Ok(None) => {
@@ -448,17 +407,21 @@ fn monitor_rollup(
 }
 
 /// Handle the rollup process exit, validating the final height.
+///
+/// The `height_slack` parameter controls how many blocks before the stop height
+/// is still considered successful. This is useful for fast resync scenarios where
+/// the rollup may exit before we can poll the final height.
 fn handle_process_exit(
     status: ExitStatus,
     last_known_height: Option<u64>,
     stop_height: Option<u64>,
     binary_path: &str,
-    lenient: bool,
+    height_slack: u64,
 ) -> Result<(), RunnerError> {
     info!(
         ?status,
         ?last_known_height,
-        lenient,
+        height_slack,
         "Rollup process exited"
     );
 
@@ -481,20 +444,11 @@ fn handle_process_exit(
         return Err(RunnerError::UnexpectedExit { last_known_height });
     };
 
-    // In lenient mode, skip strict height validation for successful exits
-    // This is useful for fast resync scenarios where the rollup may exit
-    // before we can poll the final height
-    if lenient {
-        info!(
-            ?last_known_height,
-            stop_height = stop,
-            "Rollup exited successfully (lenient mode, skipping height validation)"
-        );
-        return Ok(());
-    }
-
     let Some(height) = last_known_height else {
-        // We never got a height reading - this shouldn't happen normally
+        // We never got a height reading - this shouldn't happen normally.
+        // It IS possible if the version's runtime is very short (a few blocks) and we are
+        // resyncing past blocks very fast. This is very unlikely to come up in production. TODO:
+        // add a check for this.
         error!(
             stop_height = stop,
             "Rollup exited but height was never determined"
@@ -502,32 +456,29 @@ fn handle_process_exit(
         return Err(RunnerError::UnknownExitHeight { stop_height: stop });
     };
 
-    if height == stop {
-        // Perfect - exited exactly at stop height
-        info!(height, "Rollup completed at expected stop height");
+    // Calculate the minimum acceptable height based on slack
+    let min_acceptable = stop.saturating_sub(height_slack);
+
+    if height >= min_acceptable && height <= stop {
+        // Height is within acceptable range (stop - slack to stop)
+        if height == stop {
+            info!(height, "Rollup completed at expected stop height");
+        } else {
+            info!(
+                height,
+                stop_height = stop,
+                height_slack,
+                "Rollup completed within acceptable height range"
+            );
+        }
         Ok(())
-    } else if height == stop - 1 {
-        // Possible race condition - rollup may have exited just before we polled
-        // the final height. Error out to be safe, but provide guidance.
+    } else if height < min_acceptable {
+        // Premature exit - height is below the acceptable range
         error!(
             current_height = height,
             stop_height = stop,
-            "Rollup exited one block before stop height. This may be a race condition \
-             where the rollup processed the final block but exited before we could poll it. \
-             For safety, in case the rollup exited unexpectedly and has not in fact reached \
-             the stop height, the upgrade did not proceed automatically.
-             Please verify the rollup state manually before proceeding with any migration."
-        );
-        Err(RunnerError::PossibleRaceCondition {
-            current_height: height,
-            stop_height: stop,
-        })
-    } else if height < stop - 1 {
-        // Premature exit - this is an error
-        error!(
-            current_height = height,
-            stop_height = stop,
-            "Rollup exited prematurely"
+            min_acceptable,
+            "Rollup exited prematurely (below acceptable height range)"
         );
         Err(RunnerError::PrematureExit {
             current_height: height,
