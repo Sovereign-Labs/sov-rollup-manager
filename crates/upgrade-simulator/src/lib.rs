@@ -11,7 +11,6 @@
 mod builder;
 mod docker;
 mod error;
-mod node_config;
 mod node_runner;
 mod soak;
 mod test_case;
@@ -26,10 +25,9 @@ use tracing::{error, info, warn};
 
 pub use builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
 pub use error::TestCaseError;
-pub use test_case::{LoadTestCaseError, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
+pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
 
 use docker::PostgresDockerContainer;
-use node_config::{detect_node_layout, validate_node_layout};
 use node_runner::{NodeVersions, ProcessRegistry, build_manager_binary, run_nodes};
 use soak::{SoakManagerConfig, run_soak_coordinator};
 
@@ -73,14 +71,10 @@ pub async fn run_test_case(
         .canonicalize()
         .map_err(|e| TestCaseError::InvalidTestCaseRoot(test_case_root.clone(), e))?;
 
-    // Detect node layout (single node vs master + replicas)
-    let layout = detect_node_layout(&test_case_root, test_case.versions.len())?;
-    validate_node_layout(&layout)?;
-
     info!(
-        num_replicas = layout.num_replicas(),
-        requires_postgres = layout.requires_postgres,
-        "Detected node layout"
+        num_nodes = test_case.nodes.len(),
+        num_replicas = test_case.num_replicas(),
+        "Using detected node layout"
     );
 
     // Create temporary run directory for rollup state and DA data
@@ -97,7 +91,7 @@ pub async fn run_test_case(
     let manager_binary = build_manager_binary()?;
 
     // Build node versions for all nodes
-    let versions = test_case.build_node_versions(&builder, &layout)?;
+    let versions = test_case.build_node_versions(&builder)?;
 
     // Build mock-da URL for config interpolation (nodes connect to mock-da-server at this URL)
     let mock_da_url = format!("http://localhost:{MOCK_DA_PORT}");
@@ -105,6 +99,7 @@ pub async fn run_test_case(
     // Interpolate config files with connection strings and write to run_dir
     let versions = interpolate_node_configs(
         versions,
+        test_case,
         &run_dir,
         &postgres_container.sequencer_connection_string(),
         &mock_da_url,
@@ -113,8 +108,8 @@ pub async fn run_test_case(
     // Build soak manager config if soak testing is enabled
     let soak_manager_config = test_case.build_soak_config(&builder)?;
 
-    // Get master's API URL for soak testing
-    let master_api_url = format!("http://localhost:{}", layout.master.http_port);
+    // Get master's API URL for soak testing (nodes[0] is always master)
+    let master_api_url = format!("http://localhost:{}", test_case.nodes[0].http_port);
 
     // Genesis file is expected at {test_case_root}/genesis.json
     let genesis_path = test_case_root.join("genesis.json");
@@ -123,8 +118,15 @@ pub async fn run_test_case(
         genesis_path.to_string_lossy().into_owned(),
     ];
 
+    // Build node names for logging (from NodeType)
+    let node_names: Vec<String> = test_case
+        .nodes
+        .iter()
+        .map(|n| n.node_type.to_string())
+        .collect();
+
     // Create storage directories for all nodes
-    for node in layout.all_nodes() {
+    for node in &test_case.nodes {
         let storage_in_run_dir = run_dir.join(&node.storage_path);
         clear_storage_dir(&storage_in_run_dir)?;
     }
@@ -161,11 +163,11 @@ pub async fn run_test_case(
             test_case,
             &manager_binary,
             &versions,
+            &node_names,
             &extra_args,
             &run_dir,
             soak_manager_config.as_ref(),
             &master_api_url,
-            &layout,
             &mut postgres_container,
             &registry,
         ) => result
@@ -191,11 +193,11 @@ async fn run_test_phases(
     test_case: &TestCase,
     manager_binary: &Path,
     versions: &NodeVersions,
+    node_names: &[String],
     extra_args: &[String],
     run_dir: &Path,
     soak_manager_config: Option<&SoakManagerConfig>,
     master_api_url: &str,
-    layout: &node_config::TestNodeLayout,
     postgres_container: &mut PostgresDockerContainer,
     registry: &ProcessRegistry,
 ) -> Result<(), TestCaseError> {
@@ -203,6 +205,7 @@ async fn run_test_phases(
     run_with_soak(
         manager_binary,
         versions,
+        node_names,
         extra_args,
         run_dir,
         soak_manager_config,
@@ -224,7 +227,7 @@ async fn run_test_phases(
     );
 
     // Clear storage for all nodes
-    for node in layout.all_nodes() {
+    for node in &test_case.nodes {
         let storage_in_run_dir = run_dir.join(&node.storage_path);
         clear_storage_dir(&storage_in_run_dir)?;
     }
@@ -242,6 +245,7 @@ async fn run_test_phases(
     run_with_soak(
         manager_binary,
         &resync_versions,
+        node_names,
         extra_args,
         run_dir,
         resync_soak_config.as_ref(),
@@ -266,9 +270,11 @@ async fn run_test_phases(
 /// The nodes are the primary driver - we always wait for them to complete.
 /// Soak testing runs in the background and should exit shortly after nodes
 /// send the shutdown signal.
+#[allow(clippy::too_many_arguments)]
 async fn run_with_soak(
     manager_binary: &Path,
     versions: &NodeVersions,
+    node_names: &[String],
     extra_args: &[String],
     run_dir: &Path,
     soak_config: Option<&SoakManagerConfig>,
@@ -288,6 +294,7 @@ async fn run_with_soak(
         // Clone data for the spawned tasks
         let manager_binary = manager_binary.to_path_buf();
         let versions = versions.clone();
+        let node_names = node_names.to_vec();
         let extra_args = extra_args.to_vec();
         let run_dir = run_dir.to_path_buf();
         let soak_cfg = soak_cfg.clone();
@@ -299,6 +306,7 @@ async fn run_with_soak(
             run_nodes(
                 &manager_binary,
                 &versions,
+                &node_names,
                 &extra_args,
                 &run_dir,
                 Some(shutdown_tx),
@@ -363,6 +371,7 @@ async fn run_with_soak(
         run_nodes(
             manager_binary,
             versions,
+            node_names,
             extra_args,
             run_dir,
             None,
@@ -380,16 +389,9 @@ fn build_resync_versions(versions: &NodeVersions, extra_blocks: u64) -> NodeVers
     let mut resync = versions.clone();
 
     if extra_blocks > 0 {
-        // Extend master's last version
-        if let Some(last) = resync.master.last_mut() {
-            if let Some(stop) = last.stop_height {
-                last.stop_height = Some(stop + extra_blocks);
-            }
-        }
-
-        // Extend each replica's last version
-        for replica_versions in &mut resync.replicas {
-            if let Some(last) = replica_versions.last_mut() {
+        // Extend each node's last version
+        for node_versions in &mut resync.nodes {
+            if let Some(last) = node_versions.last_mut() {
                 if let Some(stop) = last.stop_height {
                     last.stop_height = Some(stop + extra_blocks);
                 }
@@ -454,7 +456,7 @@ async fn spawn_mock_da_server(
 
     // Register PID for cleanup on Ctrl+C
     if let Some(pid) = child.id() {
-        registry.register(node_config::NodeType::Master, pid); // Use Master as placeholder type
+        registry.register("mock-da", pid);
         info!(pid, "mock-da-server started");
     }
 
@@ -475,40 +477,28 @@ async fn spawn_mock_da_server(
 ///
 /// Placeholders:
 /// - `{postgres_connection_string}` - Sequencer database connection string
-/// - `{mock_da_connection_string}` - URL to connect to the mock-da-server (e.g., `http://localhost:50051`)
+/// - `{mock_da_url}` - URL to connect to the mock-da-server (e.g., `http://localhost:50051`)
 fn interpolate_node_configs(
     versions: NodeVersions,
+    test_case: &TestCase,
     run_dir: &Path,
     sequencer_db_url: &str,
     mock_da_url: &str,
 ) -> Result<NodeVersions, TestCaseError> {
     let mut result = NodeVersions {
-        master: Vec::with_capacity(versions.master.len()),
-        replicas: Vec::with_capacity(versions.replicas.len()),
+        nodes: Vec::with_capacity(versions.nodes.len()),
     };
 
-    // Interpolate master configs
-    for (version_idx, mut version) in versions.master.into_iter().enumerate() {
-        let new_path = interpolate_config_file(
-            &version.config_path,
-            run_dir,
-            "master",
-            version_idx,
-            sequencer_db_url,
-            mock_da_url,
-        )?;
-        version.config_path = new_path;
-        result.master.push(version);
-    }
+    // Interpolate configs for each node
+    for (node_idx, node_versions) in versions.nodes.into_iter().enumerate() {
+        let node_name = test_case.nodes[node_idx].node_type.to_string();
+        let mut interpolated_versions = Vec::with_capacity(node_versions.len());
 
-    // Interpolate replica configs
-    for (replica_idx, replica_versions) in versions.replicas.into_iter().enumerate() {
-        let mut interpolated_versions = Vec::with_capacity(replica_versions.len());
-        for (version_idx, mut version) in replica_versions.into_iter().enumerate() {
+        for (version_idx, mut version) in node_versions.into_iter().enumerate() {
             let new_path = interpolate_config_file(
                 &version.config_path,
                 run_dir,
-                &format!("replica_{replica_idx}"),
+                &node_name,
                 version_idx,
                 sequencer_db_url,
                 mock_da_url,
@@ -516,7 +506,8 @@ fn interpolate_node_configs(
             version.config_path = new_path;
             interpolated_versions.push(version);
         }
-        result.replicas.push(interpolated_versions);
+
+        result.nodes.push(interpolated_versions);
     }
 
     Ok(result)
@@ -530,7 +521,7 @@ fn interpolate_node_configs(
 ///
 /// Placeholders replaced:
 /// - `{postgres_connection_string}` - Sequencer database connection string
-/// - `{mock_da_connection_string}` - URL to connect to mock-da-server (e.g., `http://localhost:50051`)
+/// - `{mock_da_url}` - URL to connect to mock-da-server (e.g., `http://localhost:50051`)
 ///
 /// Returns the path to the new interpolated config file.
 fn interpolate_config_file(

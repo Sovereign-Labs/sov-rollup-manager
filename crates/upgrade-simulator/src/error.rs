@@ -80,6 +80,19 @@ pub enum TestCaseError {
     #[error("docker operation failed: {0}")]
     Docker(#[from] DockerError),
 
+    // Test case loading errors
+    #[error("invalid test case directory name: {0}")]
+    InvalidDirName(PathBuf),
+
+    #[error("failed to read test_case.toml at {path}: {source}")]
+    ReadTestCase { path: PathBuf, source: io::Error },
+
+    #[error("failed to parse test_case.toml at {path}: {source}")]
+    ParseTestCase {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+
     // Validation errors
     #[error("test case has no versions defined")]
     NoVersions,

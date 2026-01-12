@@ -7,7 +7,7 @@
 //! The node runner accepts a shutdown sender to notify when all nodes complete
 //! or any node fails, allowing coordination with soak testing.
 
-/// Base port for prometheus metrics (master uses this, replicas increment).
+/// Base port for prometheus metrics. Each node gets base_port + node_index.
 const METRICS_BASE_PORT: u16 = 9845;
 
 use std::fs;
@@ -25,15 +25,16 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::error::TestCaseError;
-use crate::node_config::NodeType;
 
 /// Registry for tracking spawned process PIDs.
 ///
 /// This allows external code (like signal handlers) to terminate all spawned
 /// processes for graceful shutdown on Ctrl+C.
+///
+/// Stores (name, pid) pairs where name is for logging (e.g., "master", "replica_0", "mock-da").
 #[derive(Debug, Clone, Default)]
 pub struct ProcessRegistry {
-    pids: Arc<Mutex<Vec<(NodeType, u32)>>>,
+    pids: Arc<Mutex<Vec<(String, u32)>>>,
 }
 
 impl ProcessRegistry {
@@ -41,23 +42,23 @@ impl ProcessRegistry {
         Self::default()
     }
 
-    /// Register a process PID.
-    pub fn register(&self, node_type: NodeType, pid: u32) {
+    /// Register a process PID with a name for logging.
+    pub fn register(&self, name: impl Into<String>, pid: u32) {
         if let Ok(mut pids) = self.pids.lock() {
-            pids.push((node_type, pid));
+            pids.push((name.into(), pid));
         }
     }
 
     /// Terminate all registered processes with SIGTERM.
     pub fn terminate_all(&self) {
         if let Ok(pids) = self.pids.lock() {
-            for (node_type, pid) in pids.iter() {
+            for (name, pid) in pids.iter() {
                 let nix_pid = Pid::from_raw(*pid as i32);
-                info!(node = %node_type, pid, "Sending SIGTERM to rollup-manager process");
+                info!(name, pid, "Sending SIGTERM to process");
                 if let Err(e) = signal::kill(nix_pid, Signal::SIGTERM) {
                     // ESRCH means process already exited, which is fine
                     if e != nix::errno::Errno::ESRCH {
-                        warn!(node = %node_type, pid, error = %e, "Failed to send SIGTERM");
+                        warn!(name, pid, error = %e, "Failed to send SIGTERM");
                     }
                 }
             }
@@ -73,24 +74,18 @@ impl ProcessRegistry {
 }
 
 /// Versions for all nodes in a test case.
+///
+/// `nodes[0]` is always master, `nodes[1..]` are replicas.
+/// Single-node tests have exactly one entry.
 #[derive(Debug, Clone)]
 pub struct NodeVersions {
-    /// Master node versions.
-    pub master: Vec<RollupVersion>,
-    /// Replica node versions (empty for single-node tests).
-    pub replicas: Vec<Vec<RollupVersion>>,
-}
-
-impl NodeVersions {
-    /// Get the number of replicas.
-    pub fn num_replicas(&self) -> usize {
-        self.replicas.len()
-    }
+    /// RollupVersions for each node. nodes[0] = master, nodes[1..] = replicas.
+    pub nodes: Vec<Vec<RollupVersion>>,
 }
 
 /// Result from running a single node.
 struct NodeResult {
-    node_type: NodeType,
+    node_name: String,
     result: Result<(), TestCaseError>,
 }
 
@@ -110,7 +105,8 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// # Arguments
 /// * `manager_binary` - Path to the rollup-manager binary
-/// * `versions` - Version configurations for all nodes
+/// * `versions` - Version configurations for all nodes (nodes[0] = master)
+/// * `node_names` - Names for each node (for logging), matching indices in versions.nodes
 /// * `extra_args` - Additional arguments passed through to rollup (e.g., `--genesis-path`)
 /// * `run_dir` - Working directory for all nodes (configs use relative paths from here)
 /// * `shutdown_tx` - Optional sender to notify when nodes complete or fail.
@@ -120,37 +116,32 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn run_nodes(
     manager_binary: &Path,
     versions: &NodeVersions,
+    node_names: &[String],
     extra_args: &[String],
     run_dir: &Path,
     shutdown_tx: Option<oneshot::Sender<()>>,
     registry: &ProcessRegistry,
 ) -> Result<(), TestCaseError> {
     let mut join_set: JoinSet<NodeResult> = JoinSet::new();
-    let mut child_processes: Vec<(NodeType, Child)> = Vec::new();
+    let mut child_processes: Vec<(String, Child)> = Vec::new();
 
-    // Spawn master node
-    let master_child = spawn_node(
-        manager_binary,
-        NodeType::Master,
-        &versions.master,
-        extra_args,
-        run_dir,
-    )
-    .await?;
-    child_processes.push((NodeType::Master, master_child));
+    // Spawn all node processes
+    for (node_idx, node_versions) in versions.nodes.iter().enumerate() {
+        let node_name = node_names
+            .get(node_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("node_{node_idx}"));
 
-    // Spawn replica nodes
-    for (idx, replica_versions) in versions.replicas.iter().enumerate() {
-        let node_type = NodeType::Replica(idx);
         let child = spawn_node(
             manager_binary,
-            node_type,
-            replica_versions,
+            &node_name,
+            node_idx,
+            node_versions,
             extra_args,
             run_dir,
         )
         .await?;
-        child_processes.push((node_type, child));
+        child_processes.push((node_name, child));
     }
 
     info!(
@@ -162,19 +153,19 @@ pub async fn run_nodes(
     // This allows external code (signal handlers) to terminate processes on Ctrl+C.
     // We also need these for internal error handling - kill_on_drop only sends SIGKILL,
     // which doesn't give rollup-manager a chance to terminate its child rollup process.
-    for (node_type, child) in &child_processes {
+    for (node_name, child) in &child_processes {
         if let Some(pid) = child.id() {
-            registry.register(*node_type, pid);
+            registry.register(node_name.clone(), pid);
         }
     }
 
     // Move children into the JoinSet for monitoring
-    for (node_type, child) in child_processes {
-        let node_type_clone = node_type;
+    for (node_name, child) in child_processes {
+        let name_clone = node_name.clone();
         join_set.spawn(async move {
-            let result = wait_for_node(node_type_clone, child).await;
+            let result = wait_for_node(&name_clone, child).await;
             NodeResult {
-                node_type: node_type_clone,
+                node_name: name_clone,
                 result,
             }
         });
@@ -188,7 +179,7 @@ pub async fn run_nodes(
             Ok(node_result) => {
                 if let Err(e) = node_result.result {
                     error!(
-                        node = %node_result.node_type,
+                        node = %node_result.node_name,
                         error = %e,
                         "Node failed"
                     );
@@ -204,7 +195,7 @@ pub async fn run_nodes(
                     join_set.abort_all();
                     break;
                 } else {
-                    info!(node = %node_result.node_type, "Node completed successfully");
+                    info!(node = %node_result.node_name, "Node completed successfully");
                 }
             }
             Err(join_error) => {
@@ -240,13 +231,14 @@ pub async fn run_nodes(
 /// Spawn a single rollup-manager process for a node.
 async fn spawn_node(
     manager_binary: &Path,
-    node_type: NodeType,
+    node_name: &str,
+    node_idx: usize,
     versions: &[RollupVersion],
     extra_args: &[String],
     run_dir: &Path,
 ) -> Result<Child, TestCaseError> {
     // Write manager config to JSON file
-    let config_filename = format!("manager_config_{node_type}.json");
+    let config_filename = format!("manager_config_{node_name}.json");
     let config_path = run_dir.join(&config_filename);
 
     let config = ManagerConfig {
@@ -256,16 +248,12 @@ async fn spawn_node(
         serde_json::to_string_pretty(&config).map_err(TestCaseError::SerializeManagerConfig)?;
 
     fs::write(&config_path, config_json).map_err(|e| TestCaseError::WriteManagerConfig {
-        node_type: node_type.to_string(),
+        node_type: node_name.to_string(),
         source: e,
     })?;
 
-    // Compute metrics port based on node type
-    // Master gets base port, replicas increment from there
-    let metrics_port = match node_type {
-        NodeType::Master => METRICS_BASE_PORT,
-        NodeType::Replica(idx) => METRICS_BASE_PORT + 1 + idx as u16,
-    };
+    // Compute metrics port based on node index
+    let metrics_port = METRICS_BASE_PORT + node_idx as u16;
 
     // Build command
     let mut cmd = Command::new(manager_binary);
@@ -278,7 +266,7 @@ async fn spawn_node(
         .kill_on_drop(true); // Ensure child is killed if handle is dropped
 
     info!(
-        node = %node_type,
+        node = %node_name,
         binary = %manager_binary.display(),
         config = %config_filename,
         metrics_port,
@@ -287,12 +275,12 @@ async fn spawn_node(
     );
 
     let child = cmd.spawn().map_err(|e| TestCaseError::ManagerSpawn {
-        node_type: node_type.to_string(),
+        node_type: node_name.to_string(),
         source: e,
     })?;
 
     info!(
-        node = %node_type,
+        node = %node_name,
         pid = child.id().unwrap_or(0),
         "Rollup-manager process started"
     );
@@ -301,15 +289,15 @@ async fn spawn_node(
 }
 
 /// Wait for a node's rollup-manager process to complete.
-async fn wait_for_node(node_type: NodeType, mut child: Child) -> Result<(), TestCaseError> {
+async fn wait_for_node(node_name: &str, mut child: Child) -> Result<(), TestCaseError> {
     let status = child.wait().await.map_err(|e| TestCaseError::ManagerWait {
-        node_type: node_type.to_string(),
+        node_type: node_name.to_string(),
         source: e,
     })?;
 
     if !status.success() {
         return Err(TestCaseError::ManagerNonZeroExit {
-            node_type: node_type.to_string(),
+            node_type: node_name.to_string(),
             status,
         });
     }
@@ -340,27 +328,4 @@ pub fn build_manager_binary() -> Result<PathBuf, TestCaseError> {
     info!(path = %binary_path.display(), "Rollup-manager binary built");
 
     Ok(binary_path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_node_versions_num_replicas() {
-        let versions = NodeVersions {
-            master: vec![],
-            replicas: vec![vec![], vec![]],
-        };
-        assert_eq!(versions.num_replicas(), 2);
-    }
-
-    #[test]
-    fn test_node_versions_no_replicas() {
-        let versions = NodeVersions {
-            master: vec![],
-            replicas: vec![],
-        };
-        assert_eq!(versions.num_replicas(), 0);
-    }
 }
