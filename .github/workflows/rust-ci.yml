@@ -1,0 +1,72 @@
+name: Rust CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  merge_group:
+    types: ["checks_requested"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run lint
+        run: make lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+      - name: Run tests
+        run: make test
+
+  upgrade-simulator:
+    name: Upgrade Simulator (${{ matrix.test_case }})
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        test_case:
+          - example-testcase
+          - example-testcase-multinode
+          - starter-chain-hash-upgrade
+          - starter-chain-hash-upgrade-multinode
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run upgrade simulator test case
+        working-directory: crates/upgrade-simulator
+        run: cargo run --bin upgrade-simulator -- -t "${{ matrix.test_case }}"
