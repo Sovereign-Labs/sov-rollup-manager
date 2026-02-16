@@ -11,6 +11,10 @@ pub struct RollupConfig {
     /// Path to the state file that tracks the current block height.
     pub state_file: PathBuf,
     pub runner: RunnerConfig,
+    /// Expected state version loaded from disk at startup.
+    /// If set, the rollup exits with an error if the on-disk version differs.
+    #[serde(default)]
+    pub expected_state_version: Option<u64>,
     /// Override the stop height from CLI. Simulates a misbehaving rollup
     /// that doesn't respect --stop-at-rollup-height.
     #[serde(default)]
@@ -39,6 +43,9 @@ pub struct HttpConfig {
 pub struct StateFile {
     /// Current block height.
     pub height: u64,
+    /// Schema/state version used by the current rollup binary.
+    #[serde(default)]
+    pub state_version: u64,
     /// Signals received by the rollup (in order).
     #[serde(default)]
     pub signals: Vec<String>,
