@@ -10,6 +10,8 @@ Inside the test case, the simulator expects to see the following structure:
  * `genesis.json`, which will be passed to the rollup as the genesis path
  * `test_case.toml` containing the test case definitions. `example-testcase` provides an example configuration with inline comments documenting the file format.
  * A series of folders named `v0`, `v1` etc., as many as there are versions defined in the test case, each containing a file named `config.toml` which will be passed to the rollup binary as its config file
+ * Optionally, each `vN/` folder may include a migration script named either `migration` or `migration.sh`. If present, it will be passed through to the generated rollup-manager config as that version's `migration_path`.
+   Do not include both file names in the same version directory; this is treated as an error.
 
 ### Storage path
 The test framework assumes the following about the config:
