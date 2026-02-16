@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -158,10 +159,22 @@ impl TestCase {
                 .canonicalize()
                 .map_err(|e| TestCaseError::InvalidConfigPath(config_path.clone(), e))?;
 
+            // Optional migration script for this version directory.
+            let version_dir = config_path.parent().ok_or_else(|| {
+                TestCaseError::InvalidConfigPath(
+                    config_path.clone(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "config path has no parent directory",
+                    ),
+                )
+            })?;
+            let migration_path = discover_version_migration(version_dir, i)?;
+
             rollup_versions.push(RollupVersion {
                 rollup_binary: binary_path,
                 config_path,
-                migration_path: None,
+                migration_path,
                 start_height: version_spec.start_height,
                 stop_height: Some(version_spec.stop_height),
             });
@@ -383,6 +396,48 @@ fn count_replica_configs(version_dir: &Path) -> Result<usize, TestCaseError> {
     Ok(count)
 }
 
+/// Discover an optional migration script for a version directory.
+///
+/// Supported file names are `migration` and `migration.sh`.
+/// If both exist, returns an error to avoid ambiguity.
+fn discover_version_migration(
+    version_dir: &Path,
+    version_idx: usize,
+) -> Result<Option<PathBuf>, TestCaseError> {
+    let migration = version_dir.join("migration");
+    let migration_sh = version_dir.join("migration.sh");
+
+    let has_migration = migration.is_file();
+    let has_migration_sh = migration_sh.is_file();
+
+    if has_migration && has_migration_sh {
+        return Err(TestCaseError::AmbiguousMigrationFile {
+            version: version_idx,
+            migration,
+            migration_sh,
+        });
+    }
+
+    let selected = if has_migration {
+        Some(migration)
+    } else if has_migration_sh {
+        Some(migration_sh)
+    } else {
+        None
+    };
+
+    selected
+        .map(|path| {
+            path.canonicalize()
+                .map_err(|e| TestCaseError::InvalidMigrationPath {
+                    version: version_idx,
+                    path: path.clone(),
+                    source: e,
+                })
+        })
+        .transpose()
+}
+
 /// Build a NodeInfo from a list of config paths (one per version).
 fn build_node_info(
     node_type: NodeType,
@@ -473,10 +528,82 @@ fn validate_nodes(nodes: &[NodeInfo]) -> Result<(), TestCaseError> {
 mod tests {
     use super::*;
 
+    use tempfile::TempDir;
+
     #[test]
     fn test_node_type_display() {
         assert_eq!(NodeType::Master.to_string(), "master");
         assert_eq!(NodeType::Replica(0).to_string(), "replica_0");
         assert_eq!(NodeType::Replica(5).to_string(), "replica_5");
+    }
+
+    #[test]
+    fn discover_version_migration_none_when_absent() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let migration =
+            discover_version_migration(tmp.path(), 0).expect("discovery should succeed");
+        assert!(migration.is_none());
+    }
+
+    #[test]
+    fn discover_version_migration_prefers_migration_file() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let migration_path = tmp.path().join("migration");
+        fs::write(&migration_path, "#!/bin/sh\nexit 0\n").expect("write migration");
+
+        let detected = discover_version_migration(tmp.path(), 0)
+            .expect("discovery should succeed")
+            .expect("migration should be detected");
+        assert_eq!(
+            detected,
+            migration_path.canonicalize().expect("canonical path")
+        );
+    }
+
+    #[test]
+    fn discover_version_migration_supports_migration_sh() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let migration_path = tmp.path().join("migration.sh");
+        fs::write(&migration_path, "#!/bin/sh\nexit 0\n").expect("write migration");
+
+        let detected = discover_version_migration(tmp.path(), 1)
+            .expect("discovery should succeed")
+            .expect("migration should be detected");
+        assert_eq!(
+            detected,
+            migration_path.canonicalize().expect("canonical path")
+        );
+    }
+
+    #[test]
+    fn discover_version_migration_ignores_migration_directory() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fs::create_dir(tmp.path().join("migration")).expect("create migration directory");
+
+        let detected = discover_version_migration(tmp.path(), 2).expect("discovery should succeed");
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn discover_version_migration_ignores_migration_sh_directory() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fs::create_dir(tmp.path().join("migration.sh")).expect("create migration.sh directory");
+
+        let detected = discover_version_migration(tmp.path(), 2).expect("discovery should succeed");
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn discover_version_migration_errors_if_both_files_exist() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fs::write(tmp.path().join("migration"), "#!/bin/sh\nexit 0\n").expect("write migration");
+        fs::write(tmp.path().join("migration.sh"), "#!/bin/sh\nexit 0\n")
+            .expect("write migration.sh");
+
+        let err = discover_version_migration(tmp.path(), 3).expect_err("should fail");
+        assert!(matches!(
+            err,
+            TestCaseError::AmbiguousMigrationFile { version: 3, .. }
+        ));
     }
 }

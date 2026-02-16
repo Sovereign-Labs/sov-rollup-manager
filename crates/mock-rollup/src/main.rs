@@ -58,7 +58,22 @@ fn run() -> Result<u8, String> {
     };
 
     let current_height = state.height;
-    info!(current_height, "Current state height");
+    info!(
+        current_height,
+        state_version = state.state_version,
+        "Current state loaded"
+    );
+
+    // Validate expected state version if configured.
+    if let Some(expected_state_version) = config.expected_state_version {
+        if state.state_version != expected_state_version {
+            return Err(format!(
+                "state_version ({}) != expected_state_version ({expected_state_version})",
+                state.state_version
+            ));
+        }
+        info!(expected_state_version, "State version check passed");
+    }
 
     // Validate start_at_height if provided
     if let Some(start_height) = cli.start_at_rollup_height {
@@ -159,7 +174,12 @@ fn run() -> Result<u8, String> {
     fs::write(&config.state_file, state_content)
         .map_err(|e| format!("failed to write state file: {e}"))?;
 
-    info!(final_height, signals = ?state.signals, "Processed blocks, state now at height");
+    info!(
+        final_height,
+        state_version = state.state_version,
+        signals = ?state.signals,
+        "Processed blocks, state now at height"
+    );
     info!("Mock rollup shutting down gracefully");
 
     Ok(config.exit_code.unwrap_or(0))

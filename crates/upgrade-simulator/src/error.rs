@@ -24,6 +24,22 @@ pub enum TestCaseError {
     #[error("invalid config path {0}: {1}")]
     InvalidConfigPath(PathBuf, io::Error),
 
+    #[error("invalid migration path for version {version} at {path}: {source}")]
+    InvalidMigrationPath {
+        version: usize,
+        path: PathBuf,
+        source: io::Error,
+    },
+
+    #[error(
+        "version {version} has both migration files present ({migration} and {migration_sh}); keep only one"
+    )]
+    AmbiguousMigrationFile {
+        version: usize,
+        migration: PathBuf,
+        migration_sh: PathBuf,
+    },
+
     #[error("config file not found: {0}")]
     ConfigNotFound(PathBuf),
 

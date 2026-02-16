@@ -1,4 +1,5 @@
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread;
@@ -45,7 +46,7 @@ fn mock_rollup_binary() -> PathBuf {
 
 /// Creates a rollup config TOML file that points to the given state file.
 fn write_rollup_config(dir: &TempDir, name: &str, state_file: &Path) -> PathBuf {
-    write_rollup_config_ext(dir, name, state_file, None, None, None)
+    write_rollup_config_ext(dir, name, state_file, None, None, None, None)
 }
 
 /// Creates a rollup config with optional test behavior overrides.
@@ -56,6 +57,7 @@ fn write_rollup_config_ext(
     exit_code: Option<u8>,
     override_stop_height: Option<u64>,
     idle_time_ms: Option<u64>,
+    expected_state_version: Option<u64>,
 ) -> PathBuf {
     let config_path = dir.path().join(format!("{name}.toml"));
     let config = RollupConfig {
@@ -65,6 +67,7 @@ fn write_rollup_config_ext(
                 bind_port: allocate_port(),
             },
         },
+        expected_state_version,
         exit_code,
         override_stop_height,
         idle_time_ms,
@@ -75,8 +78,13 @@ fn write_rollup_config_ext(
 }
 
 fn write_state_file(state_file: &Path, height: u64) {
+    write_state_file_with_version(state_file, height, 0);
+}
+
+fn write_state_file_with_version(state_file: &Path, height: u64, state_version: u64) {
     let state = StateFile {
         height,
+        state_version,
         signals: vec![],
     };
     let content = serde_json::to_string(&state).expect("failed to serialize state");
@@ -90,6 +98,57 @@ fn read_state_file(state_file: &PathBuf) -> StateFile {
 
 fn read_state_height(state_file: &PathBuf) -> u64 {
     read_state_file(state_file).height
+}
+
+fn read_state_version(state_file: &PathBuf) -> u64 {
+    read_state_file(state_file).state_version
+}
+
+fn make_executable(path: &Path) {
+    let mut perms = fs::metadata(path)
+        .expect("script should exist")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("failed to set executable bit");
+}
+
+fn write_state_version_migration_script(
+    dir: &TempDir,
+    name: &str,
+    state_file: &Path,
+    from_version: u64,
+    to_version: u64,
+) -> PathBuf {
+    let script_path = dir.path().join(format!("{name}.sh"));
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+
+state_file="{state_file}"
+if ! grep -q '"state_version":{from_version}' "$state_file"; then
+  echo "expected state_version {from_version} in $state_file" >&2
+  exit 91
+fi
+
+tmp_file="${{state_file}}.tmp"
+sed 's/"state_version":{from_version}/"state_version":{to_version}/' "$state_file" > "$tmp_file"
+mv "$tmp_file" "$state_file"
+"#,
+        state_file = state_file.display(),
+        from_version = from_version,
+        to_version = to_version
+    );
+    fs::write(&script_path, script).expect("failed to write migration script");
+    make_executable(&script_path);
+    script_path
+}
+
+fn write_failing_migration_script(dir: &TempDir, name: &str, exit_code: u8) -> PathBuf {
+    let script_path = dir.path().join(format!("{name}.sh"));
+    let script = format!("#!/bin/sh\nset -eu\nexit {exit_code}\n");
+    fs::write(&script_path, script).expect("failed to write migration script");
+    make_executable(&script_path);
+    script_path
 }
 
 fn read_checkpoint(path: &Path) -> Checkpoint {
@@ -149,6 +208,127 @@ fn test_two_versions_with_upgrade() {
 
     // v1: 0->100, v2: 101->200
     assert_eq!(read_state_height(&state_file), 200);
+}
+
+#[test]
+fn test_two_versions_with_state_version_migration() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+    let migration_path =
+        write_state_version_migration_script(&temp_dir, "migrate_v0_to_v1", &state_file, 0, 1);
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(100),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: Some(migration_path),
+                start_height: Some(101),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    run(&config, &[], 0, CheckpointConfig::Disabled).expect("runner should succeed");
+
+    assert_eq!(read_state_height(&state_file), 200);
+    assert_eq!(read_state_version(&state_file), 1);
+}
+
+#[test]
+fn test_state_version_mismatch_without_migration_fails_upgrade() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(100),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: None,
+                start_height: Some(101),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
+    let err = result.expect_err("runner should fail without required migration");
+    assert!(
+        matches!(err, RunnerError::NonZeroExit { .. }),
+        "runner should return NonZeroExit: {err:?}"
+    );
+    assert_eq!(read_state_height(&state_file), 100);
+    assert_eq!(read_state_version(&state_file), 0);
+}
+
+#[test]
+fn test_migration_failure_stops_upgrade() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+    let failing_migration_path = write_failing_migration_script(&temp_dir, "failing_migration", 17);
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(100),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: Some(failing_migration_path),
+                start_height: Some(101),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
+    let err = result.expect_err("runner should fail when migration exits non-zero");
+    assert!(
+        matches!(err, RunnerError::NonZeroExit { .. }),
+        "runner should return NonZeroExit: {err:?}"
+    );
+    assert_eq!(
+        err.exit_code(),
+        Some(17),
+        "migration exit code should be propagated"
+    );
+    assert_eq!(read_state_height(&state_file), 100);
+    assert_eq!(read_state_version(&state_file), 0);
 }
 
 #[test]
@@ -262,8 +442,15 @@ fn test_rollup_failure(rollup_exit_at: Option<u64>) {
     let state_file = temp_dir.path().join("state");
 
     // Create a config that tells the mock rollup to exit with code 42
-    let rollup_config =
-        write_rollup_config_ext(&temp_dir, "v1", &state_file, Some(42), rollup_exit_at, None);
+    let rollup_config = write_rollup_config_ext(
+        &temp_dir,
+        "v1",
+        &state_file,
+        Some(42),
+        rollup_exit_at,
+        None,
+        None,
+    );
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
@@ -304,7 +491,8 @@ fn test_rollup_exits_early_with_success() {
     let state_file = temp_dir.path().join("state");
 
     // Rollup will exit at height 50 (success), but manager expects it to run until 100
-    let rollup_config = write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None);
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None, None);
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
@@ -331,7 +519,7 @@ fn test_rollup_exceeds_stop_height() {
 
     // Rollup will continue to height 150, but manager expects it to stop at 100
     let rollup_config =
-        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(150), None);
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(150), None, None);
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
@@ -357,7 +545,8 @@ fn test_rollup_exits_unexpectedly() {
     let state_file = temp_dir.path().join("state");
 
     // Rollup will exit at height 50, but manager has no stop height (expects indefinite run)
-    let rollup_config = write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None);
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), None, None);
 
     let config = ManagerConfig {
         versions: vec![RollupVersion {
@@ -403,7 +592,7 @@ fn test_signal_forwarding() {
 
     // Configure the rollup to idle for a couple of seconds, giving us time to send signals
     let rollup_config =
-        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, Some(1_000));
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, Some(1_000), None);
 
     // Write manager config
     let manager_config = ManagerConfig {
