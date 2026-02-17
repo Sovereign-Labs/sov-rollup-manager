@@ -1,58 +1,56 @@
-//! Soak testing coordination for upgrade simulation.
+//! Soak testing coordination for versioned rollup execution.
 //!
-//! This module handles running soak-test workers alongside the rollup manager,
-//! coordinating version transitions based on height polling.
-//!
-//! For multi-node tests, soak testing only targets the master node since only
-//! the master can accept transactions. The soak coordinator receives a shutdown
-//! signal from the node runner when nodes complete or any node fails.
+//! This crate provides a library-first API for running soak binaries across
+//! multiple rollup versions. It keeps state in-memory and does not require
+//! config files on disk.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
-use crate::error::TestCaseError;
-use crate::test_case::SoakTestingConfig;
+/// Worker options shared across versioned soak runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoakWorkerConfig {
+    /// Number of concurrent workers.
+    pub num_workers: u32,
+    /// RNG salt used by workers.
+    pub salt: u32,
+}
 
-/// Combined soak testing configuration and version binaries.
-///
-/// This type unifies `SoakTestingConfig` with the version-specific soak binaries
-/// and their stop heights, ensuring they're always provided together.
-#[derive(Debug, Clone)]
+/// Soak manager configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoakManagerConfig {
-    /// The soak testing configuration (worker count, salt, etc.).
-    pub config: SoakTestingConfig,
-    /// Soak binary paths paired with their stop heights.
+    /// Worker config (count + base salt).
+    pub config: SoakWorkerConfig,
+    /// Soak binary paths paired with stop heights.
     pub versions: Vec<(PathBuf, u64)>,
 }
 
 impl SoakManagerConfig {
     /// Create a new soak manager config.
-    pub fn new(config: SoakTestingConfig, versions: Vec<(PathBuf, u64)>) -> Self {
+    pub fn new(config: SoakWorkerConfig, versions: Vec<(PathBuf, u64)>) -> Self {
         Self { config, versions }
     }
 
-    /// Create the soak config for resync testing.
+    /// Create a config for resync testing.
     ///
-    /// During resync, the rollup replays existing transactions and won't accept
-    /// new ones until it catches up. Soak testing only runs during the extra
-    /// blocks phase at the end.
-    ///
-    /// Returns `None` if `extra_blocks_after_resync` is 0.
+    /// During resync, only the last version is relevant. We extend its stop
+    /// height by `extra_blocks_after_resync`.
     pub fn for_resync(&self, extra_blocks_after_resync: u64) -> Option<Self> {
         if extra_blocks_after_resync == 0 {
             return None;
         }
 
-        let (last_binary, last_stop_height) = self.versions.last().expect("has versions");
+        let (last_binary, last_stop_height) = self.versions.last()?;
         let extended_stop_height = last_stop_height + extra_blocks_after_resync;
 
-        // Increment salt to avoid transaction overlap with initial run
         let mut config = self.config.clone();
         config.salt += config.num_workers * self.versions.len() as u32;
 
@@ -63,41 +61,36 @@ impl SoakManagerConfig {
     }
 }
 
-/// Wait for the rollup sequencer to be ready to accept transactions.
-///
-/// Polls `/sequencer/ready` endpoint until it returns a success response.
-/// This is an unbounded loop intended to be raced against manager completion
-/// via `tokio::select!`.
-pub async fn wait_for_sequencer_ready(api_url: &str) -> Result<(), TestCaseError> {
+#[derive(Debug, Error)]
+pub enum SoakManagerError {
+    #[error("failed to start soak process: {0}")]
+    SoakTestStartFailed(std::io::Error),
+
+    #[error("soak process failed with exit code {exit_code}")]
+    SoakTestFailed { exit_code: i32 },
+}
+
+/// Wait for the rollup sequencer to be ready.
+pub async fn wait_for_sequencer_ready(api_url: &str) {
     let client = reqwest::Client::new();
     let url = format!("{api_url}/sequencer/ready");
 
     loop {
         match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                // Returns null when ready
-                return Ok(());
-            }
-            _ => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            Ok(resp) if resp.status().is_success() => return,
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
 }
 
-/// Poll rollup height until it reaches or exceeds the target height.
-///
-/// Uses async reqwest to query the rollup's height endpoint.
-/// This is an unbounded loop intended to be raced against manager completion
-/// via `tokio::select!`.
-pub async fn wait_for_height(api_url: &str, target: u64) -> Result<(), TestCaseError> {
+/// Poll rollup height until it reaches at least `target`.
+pub async fn wait_for_height(api_url: &str, target: u64) {
     let client = reqwest::Client::new();
     let url = format!("{api_url}/modules/chain-state/state/current-heights/");
 
     loop {
         if let Ok(resp) = client.get(&url).send().await {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
-                // Response format: { "value": [rollup_height, visible_slot_number] }
                 if let Some(height) = json
                     .get("value")
                     .and_then(|v| v.as_array())
@@ -105,22 +98,23 @@ pub async fn wait_for_height(api_url: &str, target: u64) -> Result<(), TestCaseE
                     .and_then(|v| v.as_u64())
                 {
                     if height >= target {
-                        return Ok(());
+                        return;
                     }
                 }
             }
         }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Start a soak-test process with the given configuration.
+/// Start a soak-test process.
 pub fn start_soak_process(
     binary: &Path,
     api_url: &str,
     num_workers: u32,
     salt: u32,
-) -> Result<Child, TestCaseError> {
+) -> Result<Child, SoakManagerError> {
     tokio::process::Command::new(binary)
         .args([
             "--api-url",
@@ -132,35 +126,24 @@ pub fn start_soak_process(
         ])
         .kill_on_drop(true)
         .spawn()
-        .map_err(TestCaseError::SoakTestStartFailed)
+        .map_err(SoakManagerError::SoakTestStartFailed)
 }
 
 /// Stop a running soak-test process gracefully.
-///
-/// Sends SIGTERM and waits for graceful shutdown (up to 1 second),
-/// then falls back to SIGKILL if necessary.
-///
-/// Returns an error if the process had already exited with a failure code
-/// before we tried to stop it (indicating an unexpected crash).
-pub async fn stop_soak_process(mut child: Child) -> Result<(), TestCaseError> {
-    // First check if the process already exited (before we send any signal)
+pub async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError> {
     match child.try_wait() {
         Ok(Some(status)) => {
-            // Process already exited - check if it was an error
             if !status.success() {
                 let exit_code = status.code().unwrap_or(-1);
                 error!(
                     exit_code,
                     "Soak-test process exited with error before termination"
                 );
-                return Err(TestCaseError::SoakTestFailed { exit_code });
+                return Err(SoakManagerError::SoakTestFailed { exit_code });
             }
-            // Exited successfully on its own (unusual but ok)
             return Ok(());
         }
-        Ok(None) => {
-            // Process still running, proceed to stop it
-        }
+        Ok(None) => {}
         Err(e) => {
             warn!(?e, "Error checking soak-test process status");
         }
@@ -168,19 +151,16 @@ pub async fn stop_soak_process(mut child: Child) -> Result<(), TestCaseError> {
 
     let pid = match child.id() {
         Some(id) => Pid::from_raw(id as i32),
-        None => return Ok(()), // Already exited
+        None => return Ok(()),
     };
 
-    // Send SIGTERM for graceful shutdown
     if let Err(e) = kill(pid, Signal::SIGTERM) {
         warn!(?e, "Failed to send SIGTERM to soak-test process");
     }
 
-    // Wait for graceful shutdown with timeout
     match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
         Ok(Ok(status)) => {
             if !status.success() {
-                // Non-zero exit after SIGTERM is expected (signal termination)
                 info!(?status, "Soak-test process exited after SIGTERM");
             }
         }
@@ -188,7 +168,6 @@ pub async fn stop_soak_process(mut child: Child) -> Result<(), TestCaseError> {
             warn!(?e, "Error waiting for soak-test process");
         }
         Err(_) => {
-            // Timeout - force kill
             warn!("Soak-test process did not exit gracefully after 1s, sending SIGKILL");
             let _ = kill(pid, Signal::SIGKILL);
             let _ = child.wait().await;
@@ -201,7 +180,7 @@ pub async fn stop_soak_process(mut child: Child) -> Result<(), TestCaseError> {
 /// Stop a soak process if one is running.
 pub async fn stop_soak_process_if_running(
     soak_process: &mut Option<Child>,
-) -> Result<(), TestCaseError> {
+) -> Result<(), SoakManagerError> {
     if let Some(child) = soak_process.take() {
         stop_soak_process(child).await?;
     }
@@ -209,42 +188,24 @@ pub async fn stop_soak_process_if_running(
 }
 
 /// Coordinate soak testing alongside rollup nodes.
-///
-/// Monitors height to detect version transitions, stopping and restarting
-/// soak workers at each transition point. The coordinator runs until either:
-/// - All versions complete their soak testing, or
-/// - A shutdown signal is received (indicating nodes completed or failed)
-///
-/// # Arguments
-/// * `soak_config` - Soak testing configuration with binaries and stop heights
-/// * `api_url` - The master node's API URL for height polling and transactions
-/// * `shutdown_rx` - Receiver for shutdown signal from node runner
-///
-/// # Returns
-/// * `Ok(())` - Soak testing completed or was cleanly shut down
-/// * `Err(_)` - Soak test worker failed
 pub async fn run_soak_coordinator(
     soak_config: &SoakManagerConfig,
     api_url: &str,
     mut shutdown_rx: oneshot::Receiver<()>,
-) -> Result<(), TestCaseError> {
+) -> Result<(), SoakManagerError> {
     let mut soak_process: Option<Child> = None;
     let mut current_salt = soak_config.config.salt;
 
     for (idx, (binary, stop_height)) in soak_config.versions.iter().enumerate() {
-        // Wait for sequencer ready (or shutdown signal)
         tokio::select! {
             biased;
 
             _ = &mut shutdown_rx => {
-                // Nodes completed or failed - clean shutdown
                 info!("Received shutdown signal, stopping soak coordinator");
                 stop_soak_process_if_running(&mut soak_process).await?;
                 return Ok(());
             }
-            ready_result = wait_for_sequencer_ready(api_url) => {
-                ready_result?;
-            }
+            _ = wait_for_sequencer_ready(api_url) => {}
         }
 
         info!(
@@ -255,7 +216,6 @@ pub async fn run_soak_coordinator(
             "Sequencer ready, starting soak workers"
         );
 
-        // Start soak workers
         soak_process = Some(start_soak_process(
             binary,
             api_url,
@@ -263,12 +223,10 @@ pub async fn run_soak_coordinator(
             current_salt,
         )?);
 
-        // Poll height until stop_height (or shutdown signal)
         tokio::select! {
             biased;
 
             _ = &mut shutdown_rx => {
-                // Nodes completed or failed - clean shutdown
                 info!("Received shutdown signal, stopping soak coordinator");
                 stop_soak_process_if_running(&mut soak_process).await?;
                 return Ok(());
@@ -277,28 +235,21 @@ pub async fn run_soak_coordinator(
                 info!(
                     version = idx,
                     stop_height,
-                    "Reached stop height, transitioning to next version"
+                    "Reached stop height, transitioning to next soak version"
                 );
             }
         }
 
-        // Stop soak workers before version transition
         stop_soak_process_if_running(&mut soak_process).await?;
-        current_salt += soak_config.config.num_workers; // Avoid tx overlap with new salt
+        current_salt += soak_config.config.num_workers;
     }
 
-    // All versions completed - wait briefly for shutdown signal or just finish
-    // The node runner will send shutdown when all nodes complete
     info!("Soak testing completed all versions, waiting for nodes to finish");
-
-    // Give a small grace period for nodes to complete
     tokio::select! {
         _ = &mut shutdown_rx => {
             info!("Received shutdown signal after soak completion");
         }
-        _ = tokio::time::sleep(Duration::from_secs(1)) => {
-            // Timeout - nodes may still be running, that's fine
-        }
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
     }
 
     stop_soak_process_if_running(&mut soak_process).await?;

@@ -1407,6 +1407,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-soak-manager"
+version = "0.0.1"
+dependencies = [
+ "nix",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sov-versioned-artifact-builder"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1816,10 +1838,11 @@ dependencies = [
  "escargot",
  "nix",
  "rand",
- "reqwest",
  "serde",
  "serde_json",
  "sov-rollup-manager",
+ "sov-soak-manager",
+ "sov-versioned-artifact-builder",
  "tempfile",
  "thiserror",
  "tokio",

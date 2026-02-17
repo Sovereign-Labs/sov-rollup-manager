@@ -8,11 +8,9 @@
 //! - Soak testing: generating transaction load during upgrade tests
 //! - Multi-node replication testing with postgres docker containers
 
-mod builder;
 mod docker;
 mod error;
 mod node_runner;
-mod soak;
 mod test_case;
 
 use std::fs;
@@ -23,13 +21,13 @@ use std::time::Duration;
 use tokio::{process::Child, sync::oneshot};
 use tracing::{error, info, warn};
 
-pub use builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
+pub use sov_versioned_artifact_builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
 pub use error::TestCaseError;
 pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
+use sov_soak_manager::{SoakManagerConfig, run_soak_coordinator};
 
 use docker::PostgresDockerContainer;
 use node_runner::{NodeVersions, ProcessRegistry, build_manager_binary, run_nodes};
-use soak::{SoakManagerConfig, run_soak_coordinator};
 
 /// Grace period after Ctrl+C for processes to shut down gracefully.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -351,7 +349,7 @@ async fn run_with_soak(
                 // Soak failed - log but don't override nodes error if present
                 error!(error = %e, "Soak testing failed");
                 if nodes_result.is_ok() {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
             Ok(Err(join_err)) => {

@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/mock-rollup", "crates/upgrade-simulator"]
+members = [
+    "crates/mock-rollup",
+    "crates/sov-soak-manager",
+    "crates/sov-versioned-artifact-builder",
+    "crates/upgrade-simulator",
+]
 default-members = ["."]
 
 [package]

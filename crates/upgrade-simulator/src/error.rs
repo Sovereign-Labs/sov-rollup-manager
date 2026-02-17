@@ -4,9 +4,10 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+use sov_soak_manager::SoakManagerError;
+use sov_versioned_artifact_builder::BuilderError;
 use thiserror::Error;
 
-use crate::builder::BuilderError;
 use crate::docker::DockerError;
 
 /// Errors that can occur when running a test case.
@@ -83,11 +84,8 @@ pub enum TestCaseError {
     #[error("failed to parse HTTP port from config: {0}")]
     HttpPortParse(#[from] sov_rollup_manager::RollupApiError),
 
-    #[error("failed to start soak-test process: {0}")]
-    SoakTestStartFailed(io::Error),
-
-    #[error("soak-test process failed with exit code {exit_code}")]
-    SoakTestFailed { exit_code: i32 },
+    #[error("soak manager failed: {0}")]
+    SoakManager(#[from] SoakManagerError),
 
     #[error("manager task panicked: {0}")]
     ManagerTaskPanic(tokio::task::JoinError),

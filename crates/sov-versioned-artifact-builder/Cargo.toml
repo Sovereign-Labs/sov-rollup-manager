@@ -1,0 +1,11 @@
+[package]
+name = "sov-versioned-artifact-builder"
+description = "Build and cache rollup artifacts across multiple commits."
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
