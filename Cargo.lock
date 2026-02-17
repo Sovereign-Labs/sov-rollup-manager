@@ -1414,6 +1414,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1424,8 +1425,10 @@ name = "sov-versioned-artifact-builder"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "tempfile",
  "thiserror",
  "tracing",
+ "workspace-test-utils",
 ]
 
 [[package]]
@@ -1849,6 +1852,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "workspace-test-utils",
 ]
 
 [[package]]
@@ -2247,6 +2251,13 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
+
+[[package]]
+name = "workspace-test-utils"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "writeable"

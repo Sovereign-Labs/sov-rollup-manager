@@ -21,10 +21,10 @@ use std::time::Duration;
 use tokio::{process::Child, sync::oneshot};
 use tracing::{error, info, warn};
 
-pub use sov_versioned_artifact_builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
 pub use error::TestCaseError;
-pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
 use sov_soak_manager::{SoakManagerConfig, run_soak_coordinator};
+pub use sov_versioned_artifact_builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
+pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
 
 use docker::PostgresDockerContainer;
 use node_runner::{NodeVersions, ProcessRegistry, build_manager_binary, run_nodes};

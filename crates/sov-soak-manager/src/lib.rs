@@ -255,3 +255,158 @@ pub async fn run_soak_coordinator(
     stop_soak_process_if_running(&mut soak_process).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+    use tempfile::TempDir;
+
+    fn write_executable_script(path: &Path, content: &str) {
+        fs::write(path, content).expect("write script");
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("set executable permissions");
+    }
+
+    fn allocate_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        listener.local_addr().expect("local addr").port()
+    }
+
+    fn start_mock_api_server(port: u16, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind test server");
+            listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0_u8; 2048];
+                        let _ = stream.read(&mut buf);
+                        let req = String::from_utf8_lossy(&buf);
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+
+                        let body = if path.starts_with("/sequencer/ready") {
+                            "null".to_string()
+                        } else if path.starts_with("/modules/chain-state/state/current-heights/") {
+                            r#"{"value":[1,0]}"#.to_string()
+                        } else {
+                            "{}".to_string()
+                        };
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn resync_config_none_when_extra_blocks_zero() {
+        let cfg = SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: 5,
+                salt: 0,
+            },
+            vec![(PathBuf::from("/tmp/soak-v0"), 100)],
+        );
+        assert!(cfg.for_resync(0).is_none());
+    }
+
+    #[test]
+    fn resync_config_uses_last_version_and_increments_salt() {
+        let cfg = SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: 3,
+                salt: 7,
+            },
+            vec![
+                (PathBuf::from("/tmp/soak-v0"), 100),
+                (PathBuf::from("/tmp/soak-v1"), 200),
+            ],
+        );
+
+        let resync = cfg.for_resync(10).expect("resync config");
+        assert_eq!(resync.versions.len(), 1);
+        assert_eq!(resync.versions[0].0, PathBuf::from("/tmp/soak-v1"));
+        assert_eq!(resync.versions[0].1, 210);
+        assert_eq!(resync.config.salt, 13); // 7 + (3 workers * 2 versions)
+    }
+
+    #[tokio::test]
+    async fn coordinator_runs_end_to_end_with_mock_api() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let soak_script = tmp.path().join("soak.sh");
+        write_executable_script(
+            &soak_script,
+            r#"#!/bin/sh
+trap 'exit 0' TERM INT QUIT
+while true; do
+  sleep 1
+done
+"#,
+        );
+
+        let port = allocate_port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = start_mock_api_server(port, Arc::clone(&stop));
+        let api_url = format!("http://127.0.0.1:{port}");
+
+        let cfg = SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: 2,
+                salt: 5,
+            },
+            vec![(soak_script.clone(), 1), (soak_script, 1)],
+        );
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let result = run_soak_coordinator(&cfg, &api_url, shutdown_rx).await;
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join server thread");
+
+        assert!(result.is_ok(), "coordinator should succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_honors_early_shutdown() {
+        let cfg = SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: 1,
+                salt: 0,
+            },
+            vec![(PathBuf::from("/tmp/nonexistent"), 100)],
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _ = shutdown_tx.send(());
+
+        let result = run_soak_coordinator(&cfg, "http://127.0.0.1:1", shutdown_rx).await;
+        assert!(result.is_ok(), "shutdown should short-circuit coordinator");
+    }
+}

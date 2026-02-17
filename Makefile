@@ -11,4 +11,4 @@ lint:  ## cargo fmt, check and clippy.
 	cargo clippy --workspace --all-targets --all-features
 
 test:  ## Runs test suite using next test
-	@cargo nextest run --no-fail-fast --status-level skip --all-features
+	@cargo nextest run --workspace --no-fail-fast --status-level skip --all-features

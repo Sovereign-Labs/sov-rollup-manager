@@ -4,6 +4,7 @@ members = [
     "crates/sov-soak-manager",
     "crates/sov-versioned-artifact-builder",
     "crates/upgrade-simulator",
+    "crates/workspace-test-utils",
 ]
 default-members = ["."]
 

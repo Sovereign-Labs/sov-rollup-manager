@@ -221,7 +221,10 @@ impl RollupBuilder {
     }
 
     fn binary_cache_path(&self, commit: &str, cache_name: &str) -> PathBuf {
-        self.cache_dir.join("binaries").join(commit).join(cache_name)
+        self.cache_dir
+            .join("binaries")
+            .join(commit)
+            .join(cache_name)
     }
 
     /// Ensure the repository is cloned and up to date.
@@ -233,7 +236,11 @@ impl RollupBuilder {
             fs::create_dir_all(&self.cache_dir).map_err(BuilderError::CreateCacheDir)?;
 
             let output = Command::new("git")
-                .args(["clone", &self.repo_url, repo_path.to_str().unwrap_or_default()])
+                .args([
+                    "clone",
+                    &self.repo_url,
+                    repo_path.to_str().unwrap_or_default(),
+                ])
                 .output()
                 .map_err(|e| BuilderError::GitClone(e.to_string()))?;
 
@@ -336,7 +343,11 @@ impl RollupBuilder {
         Ok(binary_cache)
     }
 
-    fn get_target_binary(&self, commit: &str, target: &BuildTarget) -> Result<PathBuf, BuilderError> {
+    fn get_target_binary(
+        &self,
+        commit: &str,
+        target: &BuildTarget,
+    ) -> Result<PathBuf, BuilderError> {
         let binary_cache = self.binary_cache_path(commit, target.cache_name());
 
         if binary_cache.exists() {
@@ -414,4 +425,40 @@ pub fn prepare_artifacts(
         versions,
         mock_da_binary,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_target_cache_name_defaults_to_bin() {
+        let target = BuildTarget {
+            package: None,
+            bin: "example-bin".to_string(),
+            cache_name: None,
+            no_default_features: false,
+            features: vec![],
+            extra_args: vec![],
+        };
+        assert_eq!(target.cache_name(), "example-bin");
+    }
+
+    #[test]
+    fn prepare_artifacts_empty_versions_is_supported() {
+        let spec = BuildSpec {
+            repo_url: None,
+            targets: BuildTargets::default(),
+            versions: vec![],
+        };
+        let req = BuildRequest {
+            cache_dir: PathBuf::from("/tmp/nonexistent-cache-dir"),
+            build_soak_binaries: false,
+            build_mock_da_binary: false,
+        };
+
+        let prepared = prepare_artifacts(&spec, &req).expect("prepare should succeed");
+        assert!(prepared.versions.is_empty());
+        assert!(prepared.mock_da_binary.is_none());
+    }
 }

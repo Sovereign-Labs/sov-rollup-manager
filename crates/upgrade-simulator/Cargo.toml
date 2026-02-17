@@ -21,3 +21,6 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+workspace-test-utils = { path = "../workspace-test-utils" }

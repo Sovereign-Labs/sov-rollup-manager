@@ -9,9 +9,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sov_rollup_manager::RollupVersion;
 use sov_soak_manager::{SoakManagerConfig, SoakWorkerConfig};
 use sov_versioned_artifact_builder::{DEFAULT_REPO_URL, RollupBuilder};
-use sov_rollup_manager::RollupVersion;
 use tracing::info;
 
 use crate::error::TestCaseError;
