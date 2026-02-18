@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -22,6 +23,31 @@ fn mock_rollup_binary() -> PathBuf {
         .clone()
 }
 
+fn assert_interpolated_config(path: PathBuf) {
+    let content = fs::read_to_string(&path).expect("read interpolated config");
+
+    assert!(
+        !content.contains("{postgres_connection_string}"),
+        "placeholder should be replaced in {}",
+        path.display()
+    );
+    assert!(
+        !content.contains("{mock_da_url}"),
+        "placeholder should be replaced in {}",
+        path.display()
+    );
+    assert!(
+        content.contains("@localhost:5432/sequencer"),
+        "interpolated postgres URL should be present in {}",
+        path.display()
+    );
+    assert!(
+        content.contains("http://localhost:50051"),
+        "interpolated mock DA URL should be present in {}",
+        path.display()
+    );
+}
+
 #[test]
 /// Requires docker.
 fn e2e_upgrade_simulator_run_with_mock_rollup_wrapper() {
@@ -37,6 +63,8 @@ fn e2e_upgrade_simulator_run_with_mock_rollup_wrapper() {
     write_file(
         &test_case_dir.join("v0/config.toml"),
         r#"state_file = "node-data/state.json"
+sequencer_db_url = "{postgres_connection_string}"
+da_url = "{mock_da_url}"
 
 [storage]
 path = "node-data"
@@ -48,6 +76,8 @@ bind_port = 12400
     write_file(
         &test_case_dir.join("v1/config.toml"),
         r#"state_file = "node-data/state.json"
+sequencer_db_url = "{postgres_connection_string}"
+da_url = "{mock_da_url}"
 
 [storage]
 path = "node-data"
@@ -80,8 +110,8 @@ stop_height = 6
 
     let test_case = load_test_case(&test_case_dir).expect("load test case");
 
-    // SAFETY: this test is ignored by default and runs as a dedicated process
-    // when explicitly invoked.
+    // SAFETY: the project uses `nextest` for testing, which isolates test processes and makes it
+    // safe to set environment variables.
     unsafe {
         std::env::set_var("MOCK_ROLLUP_BINARY", mock_rollup_binary());
     }
@@ -93,4 +123,8 @@ stop_height = 6
         &test_case,
     ))
     .expect("upgrade simulator end-to-end run should succeed");
+
+    let run_dir = test_case_dir.join("run-dir").join("master");
+    assert_interpolated_config(run_dir.join("config_0.toml"));
+    assert_interpolated_config(run_dir.join("config_1.toml"));
 }

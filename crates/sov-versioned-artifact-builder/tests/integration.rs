@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use sov_versioned_artifact_builder::{
-    BuildRequest, BuildSpec, BuildTarget, BuildTargets, VersionBuildSpec, prepare_artifacts,
+    BuildRequest, BuildSpec, BuildTargets, VersionBuildSpec, prepare_artifacts,
 };
 use tempfile::TempDir;
 use workspace_test_utils::init_local_rollup_repo;
@@ -13,18 +13,7 @@ fn prepare_artifacts_builds_rollup_soak_and_mock_da() {
 
     let spec = BuildSpec {
         repo_url: Some(repo.repo_url()),
-        targets: BuildTargets {
-            rollup: None,
-            soak: None,
-            mock_da: Some(BuildTarget {
-                package: None,
-                bin: "mock-da-server".to_string(),
-                cache_name: Some("mock-da-server".to_string()),
-                no_default_features: true,
-                features: vec!["mock_da_external".to_string(), "mock_zkvm".to_string()],
-                extra_args: vec![],
-            }),
-        },
+        targets: BuildTargets::upgrade_simulator_defaults(),
         versions: vec![VersionBuildSpec {
             commit: repo.commit.clone(),
             build_soak: true,
@@ -82,4 +71,52 @@ fn prepare_artifacts_without_mock_da_skips_mock_da_build() {
     assert!(prepared.versions[0].rollup_binary.exists());
     assert!(prepared.versions[0].soak_binary.is_none());
     assert!(prepared.mock_da_binary.is_none());
+}
+
+#[test]
+fn prepare_artifacts_errors_when_soak_is_requested_but_target_is_disabled() {
+    let repo = init_local_rollup_repo();
+    let cache_dir = TempDir::new().expect("cache dir");
+
+    let spec = BuildSpec {
+        repo_url: Some(repo.repo_url()),
+        targets: BuildTargets::default(),
+        versions: vec![VersionBuildSpec {
+            commit: repo.commit.clone(),
+            build_soak: true,
+        }],
+    };
+
+    let req = BuildRequest {
+        cache_dir: PathBuf::from(cache_dir.path()),
+        build_soak_binaries: false,
+        build_mock_da_binary: false,
+    };
+
+    let err = prepare_artifacts(&spec, &req).expect_err("soak target should be disabled");
+    assert!(format!("{err}").contains("build target 'soak' is disabled"));
+}
+
+#[test]
+fn prepare_artifacts_errors_when_mock_da_is_requested_but_target_is_disabled() {
+    let repo = init_local_rollup_repo();
+    let cache_dir = TempDir::new().expect("cache dir");
+
+    let spec = BuildSpec {
+        repo_url: Some(repo.repo_url()),
+        targets: BuildTargets::default(),
+        versions: vec![VersionBuildSpec {
+            commit: repo.commit.clone(),
+            build_soak: false,
+        }],
+    };
+
+    let req = BuildRequest {
+        cache_dir: PathBuf::from(cache_dir.path()),
+        build_soak_binaries: false,
+        build_mock_da_binary: true,
+    };
+
+    let err = prepare_artifacts(&spec, &req).expect_err("mock-da target should be disabled");
+    assert!(format!("{err}").contains("build target 'mock-da-server' is disabled"));
 }

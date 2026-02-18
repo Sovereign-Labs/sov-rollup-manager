@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use tempfile::TempDir;
-use upgrade_simulator::{RollupBuilder, load_test_case};
+use upgrade_simulator::{BuildTargets, RollupBuilder, load_test_case};
 use workspace_test_utils::{init_local_rollup_repo, write_file, write_rollup_config};
 
 #[test]
@@ -47,7 +47,11 @@ stop_height = 20
 
     // Build binaries via the extracted shared builder crate (through re-export)
     let cache_dir = TempDir::new().expect("cache dir");
-    let builder = RollupBuilder::with_repo_url(PathBuf::from(cache_dir.path()), repo.repo_url());
+    let builder = RollupBuilder::with_targets(
+        PathBuf::from(cache_dir.path()),
+        repo.repo_url(),
+        BuildTargets::upgrade_simulator_defaults(),
+    );
 
     let node_versions = test_case
         .build_node_versions(&builder)

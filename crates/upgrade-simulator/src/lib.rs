@@ -23,7 +23,9 @@ use tracing::{error, info, warn};
 
 pub use error::TestCaseError;
 use sov_soak_manager::{SoakManagerConfig, run_soak_coordinator};
-pub use sov_versioned_artifact_builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
+pub use sov_versioned_artifact_builder::{
+    BuildTargets, BuilderError, DEFAULT_REPO_URL, RollupBuilder,
+};
 pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
 
 use docker::PostgresDockerContainer;
@@ -61,8 +63,12 @@ pub async fn run_test_case(
 ) -> Result<(), TestCaseError> {
     info!(name = %test_case.name, repo_url = %test_case.repo_url, "Running test case");
 
-    // Create builder with the test case's repo URL
-    let builder = RollupBuilder::with_repo_url(cache_dir.to_path_buf(), test_case.repo_url.clone());
+    // Create builder with explicit target defaults for upgrade simulation.
+    let builder = RollupBuilder::with_targets(
+        cache_dir.to_path_buf(),
+        test_case.repo_url.clone(),
+        BuildTargets::upgrade_simulator_defaults(),
+    );
 
     let test_case_root = test_root.join(&test_case.name);
     let test_case_root = test_case_root

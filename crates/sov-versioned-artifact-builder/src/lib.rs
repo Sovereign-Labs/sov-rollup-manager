@@ -85,12 +85,12 @@ fn default_mock_da_target() -> BuildTarget {
     }
 }
 
-/// Optional build-target overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Build targets used for artifact preparation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildTargets {
     /// Rollup binary build config.
-    #[serde(default)]
-    pub rollup: Option<BuildTarget>,
+    #[serde(default = "default_rollup_target")]
+    pub rollup: BuildTarget,
     /// Soak binary build config.
     #[serde(default)]
     pub soak: Option<BuildTarget>,
@@ -99,13 +99,36 @@ pub struct BuildTargets {
     pub mock_da: Option<BuildTarget>,
 }
 
+impl BuildTargets {
+    /// Target set used by upgrade-simulator.
+    ///
+    /// Includes rollup, soak, and mock-da targets.
+    pub fn upgrade_simulator_defaults() -> Self {
+        Self {
+            rollup: default_rollup_target(),
+            soak: Some(default_soak_target()),
+            mock_da: Some(default_mock_da_target()),
+        }
+    }
+}
+
+impl Default for BuildTargets {
+    fn default() -> Self {
+        Self {
+            rollup: default_rollup_target(),
+            soak: None,
+            mock_da: None,
+        }
+    }
+}
+
 /// High-level spec for preparing multiple versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSpec {
     /// Optional repository URL override.
     #[serde(default)]
     pub repo_url: Option<String>,
-    /// Optional build target overrides.
+    /// Build targets for artifact preparation.
     #[serde(default)]
     pub targets: BuildTargets,
     /// Versions to prepare.
@@ -180,24 +203,20 @@ pub enum BuilderError {
 pub struct RollupBuilder {
     cache_dir: PathBuf,
     repo_url: String,
-    rollup_target: BuildTarget,
-    soak_target: Option<BuildTarget>,
-    mock_da_target: Option<BuildTarget>,
+    targets: BuildTargets,
 }
 
 impl RollupBuilder {
-    /// Create a new builder with default repository URL and targets.
+    /// Create a new builder with the default repository URL and rollup-only targets.
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir,
             repo_url: DEFAULT_REPO_URL.to_string(),
-            rollup_target: default_rollup_target(),
-            soak_target: Some(default_soak_target()),
-            mock_da_target: Some(default_mock_da_target()),
+            targets: BuildTargets::default(),
         }
     }
 
-    /// Create a new builder with a custom repository URL.
+    /// Create a new builder with a custom repository URL and rollup-only targets.
     pub fn with_repo_url(cache_dir: PathBuf, repo_url: String) -> Self {
         Self {
             repo_url,
@@ -205,14 +224,12 @@ impl RollupBuilder {
         }
     }
 
-    /// Create a new builder with custom repository URL and target overrides.
-    pub fn with_config(cache_dir: PathBuf, repo_url: String, targets: BuildTargets) -> Self {
+    /// Create a new builder with custom repository URL and explicit targets.
+    pub fn with_targets(cache_dir: PathBuf, repo_url: String, targets: BuildTargets) -> Self {
         Self {
             cache_dir,
             repo_url,
-            rollup_target: targets.rollup.unwrap_or_else(default_rollup_target),
-            soak_target: Some(targets.soak.unwrap_or_else(default_soak_target)),
-            mock_da_target: targets.mock_da,
+            targets,
         }
     }
 
@@ -362,13 +379,14 @@ impl RollupBuilder {
 
     /// Get the rollup binary for a specific commit.
     pub fn get_binary(&self, commit: &str) -> Result<PathBuf, BuilderError> {
-        self.get_target_binary(commit, &self.rollup_target)
+        self.get_target_binary(commit, &self.targets.rollup)
     }
 
     /// Get the soak-test binary for a specific commit.
     pub fn get_soak_binary(&self, commit: &str) -> Result<PathBuf, BuilderError> {
         let target = self
-            .soak_target
+            .targets
+            .soak
             .as_ref()
             .ok_or_else(|| BuilderError::TargetDisabled("soak".to_string()))?;
         self.get_target_binary(commit, target)
@@ -377,7 +395,8 @@ impl RollupBuilder {
     /// Get the mock-da-server binary for a specific commit.
     pub fn get_mock_da_binary(&self, commit: &str) -> Result<PathBuf, BuilderError> {
         let target = self
-            .mock_da_target
+            .targets
+            .mock_da
             .as_ref()
             .ok_or_else(|| BuilderError::TargetDisabled("mock-da-server".to_string()))?;
         self.get_target_binary(commit, target)
@@ -389,7 +408,7 @@ pub fn prepare_artifacts(
     spec: &BuildSpec,
     request: &BuildRequest,
 ) -> Result<PreparedArtifacts, BuilderError> {
-    let builder = RollupBuilder::with_config(
+    let builder = RollupBuilder::with_targets(
         request.cache_dir.clone(),
         spec.repo_url
             .clone()
@@ -430,6 +449,8 @@ pub fn prepare_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use workspace_test_utils::init_local_rollup_repo;
 
     #[test]
     fn build_target_cache_name_defaults_to_bin() {
@@ -460,5 +481,43 @@ mod tests {
         let prepared = prepare_artifacts(&spec, &req).expect("prepare should succeed");
         assert!(prepared.versions.is_empty());
         assert!(prepared.mock_da_binary.is_none());
+    }
+
+    #[test]
+    fn build_targets_default_is_rollup_only() {
+        let targets = BuildTargets::default();
+        assert_eq!(targets.rollup.bin, "rollup");
+        assert!(targets.soak.is_none());
+        assert!(targets.mock_da.is_none());
+    }
+
+    #[test]
+    fn build_targets_upgrade_simulator_defaults_enable_all_targets() {
+        let targets = BuildTargets::upgrade_simulator_defaults();
+        assert_eq!(targets.rollup.bin, "rollup");
+        assert_eq!(
+            targets.soak.as_ref().map(|target| target.bin.as_str()),
+            Some("rollup-starter-soak-test")
+        );
+        assert_eq!(
+            targets.mock_da.as_ref().map(|target| target.bin.as_str()),
+            Some("mock-da-server")
+        );
+    }
+
+    #[test]
+    fn with_targets_disables_soak_when_target_missing() {
+        let repo = init_local_rollup_repo();
+        let cache_dir = TempDir::new().expect("cache dir");
+        let builder = RollupBuilder::with_targets(
+            PathBuf::from(cache_dir.path()),
+            repo.repo_url(),
+            BuildTargets::default(),
+        );
+
+        let err = builder
+            .get_soak_binary(&repo.commit)
+            .expect_err("soak should be disabled");
+        assert!(matches!(err, BuilderError::TargetDisabled(name) if name == "soak"));
     }
 }
