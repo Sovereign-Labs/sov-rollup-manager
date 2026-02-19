@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use sov_rollup_manager::RollupVersion;
+use sov_soak_manager::{SoakManagerConfig, SoakWorkerConfig};
+use sov_versioned_artifact_builder::{DEFAULT_REPO_URL, RollupBuilder};
 use tracing::info;
 
-use crate::builder::{DEFAULT_REPO_URL, RollupBuilder};
 use crate::error::TestCaseError;
 use crate::node_runner::NodeVersions;
-use crate::soak::SoakManagerConfig;
 
 /// Type of node in a test case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,10 +58,18 @@ pub struct SoakTestingConfig {
     /// Use different salts when restarting to avoid transaction overlap.
     #[serde(default)]
     pub salt: u32,
+    /// Number of blocks before each stop height where soak workers should
+    /// be terminated (default: 10).
+    #[serde(default = "default_safety_stop_blocks")]
+    pub safety_stop_blocks: u64,
 }
 
 fn default_num_workers() -> u32 {
     5
+}
+
+fn default_safety_stop_blocks() -> u64 {
+    10
 }
 
 /// A test case definition specifying versions to upgrade through.
@@ -114,7 +122,14 @@ impl TestCase {
             versions.push((binary, version_spec.stop_height));
         }
 
-        Ok(Some(SoakManagerConfig::new(soak_config.clone(), versions)))
+        Ok(Some(SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: soak_config.num_workers,
+                salt: soak_config.salt,
+            },
+            versions,
+            soak_config.safety_stop_blocks,
+        )))
     }
 
     /// Build RollupVersions for all nodes.

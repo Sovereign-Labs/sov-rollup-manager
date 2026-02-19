@@ -8,11 +8,9 @@
 //! - Soak testing: generating transaction load during upgrade tests
 //! - Multi-node replication testing with postgres docker containers
 
-mod builder;
 mod docker;
 mod error;
 mod node_runner;
-mod soak;
 mod test_case;
 
 use std::fs;
@@ -23,13 +21,15 @@ use std::time::Duration;
 use tokio::{process::Child, sync::oneshot};
 use tracing::{error, info, warn};
 
-pub use builder::{BuilderError, DEFAULT_REPO_URL, RollupBuilder};
 pub use error::TestCaseError;
+use sov_soak_manager::{SoakManagerConfig, run_soak_coordinator};
+pub use sov_versioned_artifact_builder::{
+    BuildTargets, BuilderError, DEFAULT_REPO_URL, RollupBuilder,
+};
 pub use test_case::{NodeType, SoakTestingConfig, TestCase, VersionSpec, load_test_case};
 
 use docker::PostgresDockerContainer;
 use node_runner::{NodeVersions, ProcessRegistry, build_manager_binary, run_nodes};
-use soak::{SoakManagerConfig, run_soak_coordinator};
 
 /// Grace period after Ctrl+C for processes to shut down gracefully.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -63,8 +63,12 @@ pub async fn run_test_case(
 ) -> Result<(), TestCaseError> {
     info!(name = %test_case.name, repo_url = %test_case.repo_url, "Running test case");
 
-    // Create builder with the test case's repo URL
-    let builder = RollupBuilder::with_repo_url(cache_dir.to_path_buf(), test_case.repo_url.clone());
+    // Create builder with explicit target defaults for upgrade simulation.
+    let builder = RollupBuilder::with_targets(
+        cache_dir.to_path_buf(),
+        test_case.repo_url.clone(),
+        BuildTargets::upgrade_simulator_defaults(),
+    );
 
     let test_case_root = test_root.join(&test_case.name);
     let test_case_root = test_case_root
@@ -351,7 +355,7 @@ async fn run_with_soak(
                 // Soak failed - log but don't override nodes error if present
                 error!(error = %e, "Soak testing failed");
                 if nodes_result.is_ok() {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
             Ok(Err(join_err)) => {

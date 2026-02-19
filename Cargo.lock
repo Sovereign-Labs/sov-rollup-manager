@@ -1407,6 +1407,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-soak-manager"
+version = "0.0.1"
+dependencies = [
+ "nix",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sov-versioned-artifact-builder"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "workspace-test-utils",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1816,16 +1841,18 @@ dependencies = [
  "escargot",
  "nix",
  "rand",
- "reqwest",
  "serde",
  "serde_json",
  "sov-rollup-manager",
+ "sov-soak-manager",
+ "sov-versioned-artifact-builder",
  "tempfile",
  "thiserror",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "workspace-test-utils",
 ]
 
 [[package]]
@@ -2224,6 +2251,13 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
+
+[[package]]
+name = "workspace-test-utils"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "writeable"

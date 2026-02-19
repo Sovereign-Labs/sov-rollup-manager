@@ -4,6 +4,9 @@
 help: ## Display this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
+fmt: ## cargo fmt fix
+	cargo +nightly fmt --all
+
 lint:  ## cargo fmt, check and clippy.
 	## fmt first, because it's the cheapest
 	cargo fmt --all --check
@@ -11,4 +14,4 @@ lint:  ## cargo fmt, check and clippy.
 	cargo clippy --workspace --all-targets --all-features
 
 test:  ## Runs test suite using next test
-	@cargo nextest run --no-fail-fast --status-level skip --all-features
+	@cargo nextest run --workspace --no-fail-fast --status-level skip --all-features
