@@ -31,12 +31,28 @@ pub struct SoakManagerConfig {
     pub config: SoakWorkerConfig,
     /// Soak binary paths paired with stop heights.
     pub versions: Vec<(PathBuf, u64)>,
+    /// Number of blocks before each version stop height where soak workers
+    /// should be terminated to avoid shutdown races.
+    #[serde(default = "default_safety_stop_blocks")]
+    pub safety_stop_blocks: u64,
+}
+
+fn default_safety_stop_blocks() -> u64 {
+    3
 }
 
 impl SoakManagerConfig {
     /// Create a new soak manager config.
-    pub fn new(config: SoakWorkerConfig, versions: Vec<(PathBuf, u64)>) -> Self {
-        Self { config, versions }
+    pub fn new(
+        config: SoakWorkerConfig,
+        versions: Vec<(PathBuf, u64)>,
+        safety_stop_blocks: u64,
+    ) -> Self {
+        Self {
+            config,
+            versions,
+            safety_stop_blocks,
+        }
     }
 
     /// Create a config for resync testing.
@@ -57,6 +73,7 @@ impl SoakManagerConfig {
         Some(Self {
             config,
             versions: vec![(last_binary.clone(), extended_stop_height)],
+            safety_stop_blocks: self.safety_stop_blocks,
         })
     }
 }
@@ -70,38 +87,57 @@ pub enum SoakManagerError {
     SoakTestFailed { exit_code: i32 },
 }
 
-/// Wait for the rollup sequencer to be ready.
-pub async fn wait_for_sequencer_ready(api_url: &str) {
+/// Wait until the sequencer is ready and the height is strictly above
+/// `previous_stop_height`.
+///
+/// This is used to detect that a rollup restart has fully completed before
+/// launching the next soak binary.
+async fn wait_for_sequencer_ready_and_height_gt(api_url: &str, previous_stop_height: u64) {
     let client = reqwest::Client::new();
-    let url = format!("{api_url}/sequencer/ready");
+    let ready_url = format!("{api_url}/sequencer/ready");
+    let height_url = format!("{api_url}/modules/chain-state/state/current-heights/");
 
     loop {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => return,
-            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        let is_ready = client
+            .get(&ready_url)
+            .send()
+            .await
+            .map(|resp| resp.status().is_success())
+            .unwrap_or(false);
+
+        if is_ready
+            && fetch_height(&client, &height_url)
+                .await
+                .map(|height| height > previous_stop_height)
+                .unwrap_or(false)
+        {
+            return;
         }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+async fn fetch_height(client: &reqwest::Client, url: &str) -> Option<u64> {
+    let resp = client.get(url).send().await.ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    json.get("value")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_u64())
+}
+
 /// Poll rollup height until it reaches at least `target`.
-pub async fn wait_for_height(api_url: &str, target: u64) {
+async fn wait_for_height(api_url: &str, target: u64) {
     let client = reqwest::Client::new();
     let url = format!("{api_url}/modules/chain-state/state/current-heights/");
 
     loop {
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(height) = json
-                    .get("value")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_u64())
-                {
-                    if height >= target {
-                        return;
-                    }
-                }
-            }
+        if fetch_height(&client, &url)
+            .await
+            .is_some_and(|height| height >= target)
+        {
+            return;
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -109,7 +145,7 @@ pub async fn wait_for_height(api_url: &str, target: u64) {
 }
 
 /// Start a soak-test process.
-pub fn start_soak_process(
+fn start_soak_process(
     binary: &Path,
     api_url: &str,
     num_workers: u32,
@@ -130,7 +166,7 @@ pub fn start_soak_process(
 }
 
 /// Stop a running soak-test process gracefully.
-pub async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError> {
+async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError> {
     match child.try_wait() {
         Ok(Some(status)) => {
             if !status.success() {
@@ -178,7 +214,7 @@ pub async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError>
 }
 
 /// Stop a soak process if one is running.
-pub async fn stop_soak_process_if_running(
+async fn stop_soak_process_if_running(
     soak_process: &mut Option<Child>,
 ) -> Result<(), SoakManagerError> {
     if let Some(child) = soak_process.take() {
@@ -195,6 +231,7 @@ pub async fn run_soak_coordinator(
 ) -> Result<(), SoakManagerError> {
     let mut soak_process: Option<Child> = None;
     let mut current_salt = soak_config.config.salt;
+    let mut previous_stop_height = 0_u64;
 
     for (idx, (binary, stop_height)) in soak_config.versions.iter().enumerate() {
         tokio::select! {
@@ -205,15 +242,16 @@ pub async fn run_soak_coordinator(
                 stop_soak_process_if_running(&mut soak_process).await?;
                 return Ok(());
             }
-            _ = wait_for_sequencer_ready(api_url) => {}
+            _ = wait_for_sequencer_ready_and_height_gt(api_url, previous_stop_height) => {}
         }
 
         info!(
             version = idx,
             binary = %binary.display(),
+            previous_stop_height,
             stop_height,
             salt = current_salt,
-            "Sequencer ready, starting soak workers"
+            "Sequencer ready and height advanced, starting soak workers"
         );
 
         soak_process = Some(start_soak_process(
@@ -223,6 +261,8 @@ pub async fn run_soak_coordinator(
             current_salt,
         )?);
 
+        let soak_stop_height = stop_height.saturating_sub(soak_config.safety_stop_blocks);
+
         tokio::select! {
             biased;
 
@@ -231,17 +271,20 @@ pub async fn run_soak_coordinator(
                 stop_soak_process_if_running(&mut soak_process).await?;
                 return Ok(());
             }
-            _ = wait_for_height(api_url, *stop_height) => {
+            _ = wait_for_height(api_url, soak_stop_height) => {
                 info!(
                     version = idx,
-                    stop_height,
-                    "Reached stop height, transitioning to next soak version"
+                    configured_stop_height = stop_height,
+                    safety_stop_blocks = soak_config.safety_stop_blocks,
+                    soak_stop_height,
+                    "Reached soak stop height, transitioning to next soak version"
                 );
             }
         }
 
         stop_soak_process_if_running(&mut soak_process).await?;
         current_salt += soak_config.config.num_workers;
+        previous_stop_height = *stop_height;
     }
 
     info!("Soak testing completed all versions, waiting for nodes to finish");
@@ -265,7 +308,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
     use std::thread;
     use tempfile::TempDir;
@@ -282,7 +325,11 @@ mod tests {
         listener.local_addr().expect("local addr").port()
     }
 
-    fn start_mock_api_server(port: u16, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    fn start_mock_api_server(
+        port: u16,
+        stop: Arc<AtomicBool>,
+        height: Arc<AtomicU64>,
+    ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind test server");
             listener
@@ -304,7 +351,8 @@ mod tests {
                         let body = if path.starts_with("/sequencer/ready") {
                             "null".to_string()
                         } else if path.starts_with("/modules/chain-state/state/current-heights/") {
-                            r#"{"value":[1,0]}"#.to_string()
+                            let next_height = height.fetch_add(1, Ordering::Relaxed) + 1;
+                            format!(r#"{{"value":[{next_height},0]}}"#)
                         } else {
                             "{}".to_string()
                         };
@@ -333,6 +381,7 @@ mod tests {
                 salt: 0,
             },
             vec![(PathBuf::from("/tmp/soak-v0"), 100)],
+            4,
         );
         assert!(cfg.for_resync(0).is_none());
     }
@@ -348,6 +397,7 @@ mod tests {
                 (PathBuf::from("/tmp/soak-v0"), 100),
                 (PathBuf::from("/tmp/soak-v1"), 200),
             ],
+            7,
         );
 
         let resync = cfg.for_resync(10).expect("resync config");
@@ -355,6 +405,7 @@ mod tests {
         assert_eq!(resync.versions[0].0, PathBuf::from("/tmp/soak-v1"));
         assert_eq!(resync.versions[0].1, 210);
         assert_eq!(resync.config.salt, 13); // 7 + (3 workers * 2 versions)
+        assert_eq!(resync.safety_stop_blocks, 7);
     }
 
     #[tokio::test]
@@ -373,7 +424,8 @@ done
 
         let port = allocate_port();
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = start_mock_api_server(port, Arc::clone(&stop));
+        let height = Arc::new(AtomicU64::new(0));
+        let handle = start_mock_api_server(port, Arc::clone(&stop), Arc::clone(&height));
         let api_url = format!("http://127.0.0.1:{port}");
 
         let cfg = SoakManagerConfig::new(
@@ -381,7 +433,8 @@ done
                 num_workers: 2,
                 salt: 5,
             },
-            vec![(soak_script.clone(), 1), (soak_script, 1)],
+            vec![(soak_script.clone(), 3), (soak_script, 6)],
+            1,
         );
 
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -401,6 +454,7 @@ done
                 salt: 0,
             },
             vec![(PathBuf::from("/tmp/nonexistent"), 100)],
+            0,
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

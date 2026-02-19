@@ -58,10 +58,18 @@ pub struct SoakTestingConfig {
     /// Use different salts when restarting to avoid transaction overlap.
     #[serde(default)]
     pub salt: u32,
+    /// Number of blocks before each stop height where soak workers should
+    /// be terminated (default: 10).
+    #[serde(default = "default_safety_stop_blocks")]
+    pub safety_stop_blocks: u64,
 }
 
 fn default_num_workers() -> u32 {
     5
+}
+
+fn default_safety_stop_blocks() -> u64 {
+    10
 }
 
 /// A test case definition specifying versions to upgrade through.
@@ -120,6 +128,7 @@ impl TestCase {
                 salt: soak_config.salt,
             },
             versions,
+            soak_config.safety_stop_blocks,
         )))
     }
 
