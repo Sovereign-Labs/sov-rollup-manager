@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -186,6 +186,15 @@ pub enum BuilderError {
     #[error("git checkout failed for commit {commit}: {message}")]
     GitCheckout { commit: String, message: String },
 
+    #[error("git show failed for '{spec}': {message}")]
+    GitShow { spec: String, message: String },
+
+    #[error("invalid UTF-8 while reading '{spec}': {source}")]
+    InvalidUtf8 {
+        spec: String,
+        source: std::string::FromUtf8Error,
+    },
+
     #[error("cargo build failed: {0}")]
     CargoBuild(String),
 
@@ -282,6 +291,35 @@ impl RollupBuilder {
         }
 
         Ok(())
+    }
+
+    fn show_file_at_commit(
+        &self,
+        commit: &str,
+        source_path: &Path,
+    ) -> Result<Vec<u8>, BuilderError> {
+        self.ensure_repo()?;
+
+        let repo_path = self.repo_path();
+        let spec = format!("{}:{}", commit, source_path.to_string_lossy());
+
+        let output = Command::new("git")
+            .current_dir(&repo_path)
+            .args(["show", &spec])
+            .output()
+            .map_err(|e| BuilderError::GitShow {
+                spec: spec.clone(),
+                message: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(BuilderError::GitShow {
+                spec,
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        Ok(output.stdout)
     }
 
     fn checkout(&self, commit: &str) -> Result<(), BuilderError> {
@@ -401,6 +439,17 @@ impl RollupBuilder {
             .ok_or_else(|| BuilderError::TargetDisabled("mock-da-server".to_string()))?;
         self.get_target_binary(commit, target)
     }
+
+    /// Read a UTF-8 text file from a specific commit without checking out that commit.
+    pub fn read_text_file_at_commit(
+        &self,
+        commit: &str,
+        source_path: &Path,
+    ) -> Result<String, BuilderError> {
+        let spec = format!("{}:{}", commit, source_path.to_string_lossy());
+        let bytes = self.show_file_at_commit(commit, source_path)?;
+        String::from_utf8(bytes).map_err(|source| BuilderError::InvalidUtf8 { spec, source })
+    }
 }
 
 /// Prepare artifacts for all versions in the spec.
@@ -449,6 +498,7 @@ pub fn prepare_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
     use workspace_test_utils::init_local_rollup_repo;
 
@@ -519,5 +569,18 @@ mod tests {
             .get_soak_binary(&repo.commit)
             .expect_err("soak should be disabled");
         assert!(matches!(err, BuilderError::TargetDisabled(name) if name == "soak"));
+    }
+
+    #[test]
+    fn read_text_file_at_commit_reads_file_contents() {
+        let repo = init_local_rollup_repo();
+        let cache_dir = TempDir::new().expect("cache dir");
+        let builder =
+            RollupBuilder::with_repo_url(PathBuf::from(cache_dir.path()), repo.repo_url());
+
+        let cargo_toml = builder
+            .read_text_file_at_commit(&repo.commit, Path::new("Cargo.toml"))
+            .expect("read file at commit");
+        assert!(cargo_toml.contains("name = \"rollup-starter-soak-test\""));
     }
 }
