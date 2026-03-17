@@ -83,6 +83,9 @@ pub enum SoakManagerError {
     #[error("failed to start soak process: {0}")]
     SoakTestStartFailed(std::io::Error),
 
+    #[error("failed to wait for soak process: {0}")]
+    SoakTestWaitFailed(std::io::Error),
+
     #[error("soak process failed with exit code {exit_code}")]
     SoakTestFailed { exit_code: i32 },
 }
@@ -280,6 +283,24 @@ pub async fn run_soak_coordinator(
                     "Reached soak stop height, transitioning to next soak version"
                 );
             }
+            status = async {
+                let child = soak_process
+                    .as_mut()
+                    .expect("soak process must exist while waiting for stop height");
+                child.wait().await
+            } => {
+                let status = status.map_err(SoakManagerError::SoakTestWaitFailed)?;
+                let exit_code = status.code().unwrap_or(-1);
+                error!(
+                    version = idx,
+                    exit_code,
+                    configured_stop_height = stop_height,
+                    safety_stop_blocks = soak_config.safety_stop_blocks,
+                    soak_stop_height,
+                    "Soak-test process exited before the configured stop height"
+                );
+                return Err(SoakManagerError::SoakTestFailed { exit_code });
+            }
         }
 
         stop_soak_process_if_running(&mut soak_process).await?;
@@ -462,5 +483,46 @@ done
 
         let result = run_soak_coordinator(&cfg, "http://127.0.0.1:1", shutdown_rx).await;
         assert!(result.is_ok(), "shutdown should short-circuit coordinator");
+    }
+
+    #[tokio::test]
+    async fn coordinator_fails_when_soak_process_exits_early() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let soak_script = tmp.path().join("fail-fast-soak.sh");
+        write_executable_script(
+            &soak_script,
+            r#"#!/bin/sh
+exit 1
+"#,
+        );
+
+        let port = allocate_port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let height = Arc::new(AtomicU64::new(0));
+        let handle = start_mock_api_server(port, Arc::clone(&stop), Arc::clone(&height));
+        let api_url = format!("http://127.0.0.1:{port}");
+
+        let cfg = SoakManagerConfig::new(
+            SoakWorkerConfig {
+                num_workers: 1,
+                salt: 0,
+            },
+            vec![(soak_script, 1_000)],
+            0,
+        );
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let result = run_soak_coordinator(&cfg, &api_url, shutdown_rx).await;
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join server thread");
+
+        assert!(
+            matches!(
+                result,
+                Err(SoakManagerError::SoakTestFailed { exit_code: 1 })
+            ),
+            "unexpected coordinator result: {result:?}"
+        );
     }
 }
