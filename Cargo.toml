@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mock-rollup",
+    "crates/sov-rollup-versioned-setup",
     "crates/sov-soak-manager",
     "crates/sov-versioned-artifact-builder",
     "crates/upgrade-simulator",
