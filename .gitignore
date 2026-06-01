@@ -1,3 +1,4 @@
 /target
 /crates/upgrade-simulator/rollup-build-cache
 /crates/upgrade-simulator/test-cases/**/run-dir
+.codex
