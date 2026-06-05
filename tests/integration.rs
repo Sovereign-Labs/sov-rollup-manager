@@ -118,11 +118,19 @@ fn write_state_version_migration_script(
     state_file: &Path,
     from_version: u64,
     to_version: u64,
+    expected_config_path: &Path,
 ) -> PathBuf {
     let script_path = dir.path().join(format!("{name}.sh"));
     let script = format!(
         r#"#!/bin/sh
 set -eu
+
+# The manager must invoke migrations with --rollup-config-path <config_path>
+# of the version being started (rollup-db-migration requires it).
+if [ "${{1:-}}" != "--rollup-config-path" ] || [ "${{2:-}}" != "{expected_config_path}" ]; then
+  echo "expected '--rollup-config-path {expected_config_path}', got: $*" >&2
+  exit 92
+fi
 
 state_file="{state_file}"
 if ! grep -q '"state_version":{from_version}' "$state_file"; then
@@ -136,7 +144,8 @@ mv "$tmp_file" "$state_file"
 "#,
         state_file = state_file.display(),
         from_version = from_version,
-        to_version = to_version
+        to_version = to_version,
+        expected_config_path = expected_config_path.display()
     );
     fs::write(&script_path, script).expect("failed to write migration script");
     make_executable(&script_path);
@@ -219,8 +228,14 @@ fn test_two_versions_with_state_version_migration() {
         write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
     let rollup_config_v1 =
         write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
-    let migration_path =
-        write_state_version_migration_script(&temp_dir, "migrate_v0_to_v1", &state_file, 0, 1);
+    let migration_path = write_state_version_migration_script(
+        &temp_dir,
+        "migrate_v0_to_v1",
+        &state_file,
+        0,
+        1,
+        &rollup_config_v1,
+    );
 
     let config = ManagerConfig {
         versions: vec![

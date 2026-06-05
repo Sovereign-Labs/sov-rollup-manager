@@ -14,6 +14,7 @@ pub struct RollupVersion {
 
     /// Optional path to a migration binary/script to run before starting this version.
     /// This is run after the previous version stops and before this version starts.
+    /// It is invoked with `--rollup-config-path <config_path>` of this version.
     #[serde(default)]
     pub migration_path: Option<PathBuf>,
 

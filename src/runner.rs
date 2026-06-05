@@ -1,6 +1,6 @@
 //! Runner for executing rollup versions with height monitoring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
@@ -219,8 +219,12 @@ pub fn run(
 
         // Run migration if specified
         if let Some(ref migration_path) = version.migration_path {
-            info!(migration = %migration_path.display(), "Running migration");
-            run_migration(migration_path.to_str().unwrap())?;
+            info!(
+                migration = %migration_path.display(),
+                config = %version.config_path.display(),
+                "Running migration"
+            );
+            run_migration(migration_path.to_str().unwrap(), &version.config_path)?;
         }
 
         // Build arguments for the rollup binary
@@ -256,12 +260,20 @@ fn build_rollup_args(version: &RollupVersion) -> Vec<String> {
     args
 }
 
-/// Run a migration binary (simple spawn and wait).
-fn run_migration(path: &str) -> Result<(), RunnerError> {
-    let mut child = Command::new(path).spawn().map_err(|e| RunnerError::Spawn {
-        path: path.to_string(),
-        source: e,
-    })?;
+/// Run a migration binary (spawn and wait).
+///
+/// The migration is invoked with `--rollup-config-path <config_path>` of the
+/// version being started, so it can locate the rollup storage to migrate
+/// (e.g. rollup-starter's `rollup-db-migration`).
+fn run_migration(path: &str, config_path: &Path) -> Result<(), RunnerError> {
+    let mut child = Command::new(path)
+        .arg("--rollup-config-path")
+        .arg(config_path)
+        .spawn()
+        .map_err(|e| RunnerError::Spawn {
+            path: path.to_string(),
+            source: e,
+        })?;
 
     let status = child.wait().map_err(|e| RunnerError::Wait {
         path: path.to_string(),
