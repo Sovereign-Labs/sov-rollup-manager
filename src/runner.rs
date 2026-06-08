@@ -5,8 +5,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
 
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use rustix::process::{Pid, Signal, kill_process};
 use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 use thiserror::Error;
@@ -75,7 +74,7 @@ pub enum RunnerError {
     #[error("failed to send {signal} to rollup process: {source}")]
     Signal {
         signal: &'static str,
-        source: nix::Error,
+        source: rustix::io::Errno,
     },
 
     #[error("failed to register signal handler: {0}")]
@@ -335,18 +334,18 @@ fn monitor_rollup(
     height_slack: u64,
 ) -> Result<(), RunnerError> {
     let mut last_known_height: Option<u64> = None;
-    let pid = Pid::from_raw(child.id() as i32);
+    let pid = Pid::from_raw(child.id() as i32).expect("spawned child has a non-zero PID");
 
     loop {
         // Check for signals to forward to the child process
         for sig in signals.pending() {
             let signal = match sig {
-                SIGTERM => Signal::SIGTERM,
-                SIGQUIT => Signal::SIGQUIT,
+                SIGTERM => Signal::TERM,
+                SIGQUIT => Signal::QUIT,
                 _ => continue,
             };
             info!(?signal, "Forwarding signal to rollup process");
-            if let Err(e) = signal::kill(pid, signal) {
+            if let Err(e) = kill_process(pid, signal) {
                 warn!(error = %e, ?signal, "Failed to forward signal");
             }
         }
@@ -500,10 +499,10 @@ fn handle_process_exit(
 
 /// Terminate a process gracefully (SIGTERM), then forcefully (SIGKILL) if needed.
 fn terminate_process(child: &mut Child) -> Result<(), RunnerError> {
-    let pid = Pid::from_raw(child.id() as i32);
+    let pid = Pid::from_raw(child.id() as i32).expect("spawned child has a non-zero PID");
 
     info!(%pid, "Sending SIGTERM to rollup process");
-    signal::kill(pid, Signal::SIGTERM).map_err(|e| RunnerError::Signal {
+    kill_process(pid, Signal::TERM).map_err(|e| RunnerError::Signal {
         signal: "SIGTERM",
         source: e,
     })?;
@@ -528,7 +527,7 @@ fn terminate_process(child: &mut Child) -> Result<(), RunnerError> {
 
     // Graceful shutdown timed out, force kill
     warn!(%pid, "Graceful shutdown timed out, sending SIGKILL");
-    signal::kill(pid, Signal::SIGKILL).map_err(|e| RunnerError::Signal {
+    kill_process(pid, Signal::KILL).map_err(|e| RunnerError::Signal {
         signal: "SIGKILL",
         source: e,
     })?;

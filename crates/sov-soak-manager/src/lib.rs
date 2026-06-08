@@ -7,8 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Child;
@@ -188,12 +187,12 @@ async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError> {
         }
     }
 
-    let pid = match child.id() {
-        Some(id) => Pid::from_raw(id as i32),
+    let pid = match child.id().and_then(|id| Pid::from_raw(id as i32)) {
+        Some(pid) => pid,
         None => return Ok(()),
     };
 
-    if let Err(e) = kill(pid, Signal::SIGTERM) {
+    if let Err(e) = kill_process(pid, Signal::TERM) {
         warn!(?e, "Failed to send SIGTERM to soak-test process");
     }
 
@@ -208,7 +207,7 @@ async fn stop_soak_process(mut child: Child) -> Result<(), SoakManagerError> {
         }
         Err(_) => {
             warn!("Soak-test process did not exit gracefully after 1s, sending SIGKILL");
-            let _ = kill(pid, Signal::SIGKILL);
+            let _ = kill_process(pid, Signal::KILL);
             let _ = child.wait().await;
         }
     }

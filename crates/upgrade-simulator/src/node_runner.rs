@@ -16,8 +16,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use rustix::process::{Pid, Signal, kill_process};
 use sov_rollup_manager::{ManagerConfig, RollupVersion};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -53,11 +52,13 @@ impl ProcessRegistry {
     pub fn terminate_all(&self) {
         if let Ok(pids) = self.pids.lock() {
             for (name, pid) in pids.iter() {
-                let nix_pid = Pid::from_raw(*pid as i32);
+                let Some(rustix_pid) = Pid::from_raw(*pid as i32) else {
+                    continue;
+                };
                 info!(name, pid, "Sending SIGTERM to process");
-                if let Err(e) = signal::kill(nix_pid, Signal::SIGTERM) {
+                if let Err(e) = kill_process(rustix_pid, Signal::TERM) {
                     // ESRCH means process already exited, which is fine
-                    if e != nix::errno::Errno::ESRCH {
+                    if e != rustix::io::Errno::SRCH {
                         warn!(name, pid, error = %e, "Failed to send SIGTERM");
                     }
                 }

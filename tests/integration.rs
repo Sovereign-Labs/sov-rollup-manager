@@ -7,8 +7,7 @@ use std::time::Duration;
 use std::{fs, path::Path};
 
 use escargot::CargoBuild;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
 use mock_rollup::{HttpConfig, RollupConfig, RunnerConfig, StateFile};
@@ -622,19 +621,19 @@ fn test_signal_forwarding() {
         .spawn()
         .expect("failed to spawn manager");
 
-    let manager_pid = Pid::from_raw(child.id() as i32);
+    let manager_pid = Pid::from_raw(child.id() as i32).expect("spawned child has a non-zero PID");
 
     // Wait for the rollup to start and begin idling
     thread::sleep(Duration::from_millis(500));
 
     // Send signals to the manager (which should forward them to the rollup)
-    signal::kill(manager_pid, Signal::SIGQUIT).expect("failed to send SIGQUIT");
+    kill_process(manager_pid, Signal::QUIT).expect("failed to send SIGQUIT");
     thread::sleep(Duration::from_millis(100));
 
-    signal::kill(manager_pid, Signal::SIGTERM).expect("failed to send SIGTERM");
+    kill_process(manager_pid, Signal::TERM).expect("failed to send SIGTERM");
     thread::sleep(Duration::from_millis(100));
 
-    signal::kill(manager_pid, Signal::SIGQUIT).expect("failed to send SIGHUP");
+    kill_process(manager_pid, Signal::QUIT).expect("failed to send SIGHUP");
 
     // Wait for the manager to exit
     let status = child.wait().expect("failed to wait for manager");
