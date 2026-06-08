@@ -633,7 +633,7 @@ fn test_signal_forwarding() {
     kill_process(manager_pid, Signal::TERM).expect("failed to send SIGTERM");
     thread::sleep(Duration::from_millis(100));
 
-    kill_process(manager_pid, Signal::QUIT).expect("failed to send SIGHUP");
+    kill_process(manager_pid, Signal::QUIT).expect("failed to send SIGQUIT");
 
     // Wait for the manager to exit
     let status = child.wait().expect("failed to wait for manager");
