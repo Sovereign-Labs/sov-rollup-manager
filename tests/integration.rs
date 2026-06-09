@@ -581,6 +581,63 @@ fn test_rollup_exits_unexpectedly() {
     );
 }
 
+#[test]
+fn test_immediate_exit_at_stop_height_succeeds() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // idle_time_ms = 0: the rollup reaches the stop height and exits *immediately*,
+    // the fast-resync scenario that height polling used to miss. The height
+    // subscription must still observe the final height before the socket closes.
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, Some(0), None);
+
+    let config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+
+    run(&config, &[], 0, CheckpointConfig::Disabled).expect(
+        "runner should succeed when the rollup reaches the stop height and exits immediately",
+    );
+
+    assert_eq!(read_state_height(&state_file), 100);
+}
+
+#[test]
+fn test_immediate_exit_below_stop_height_is_premature() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+
+    // The rollup exits cleanly (code 0) and *immediately* at height 50, below the
+    // stop height of 100. Because the subscription delivers the true final height,
+    // a genuine early stop is still flagged rather than masked by the clean exit.
+    let rollup_config =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, Some(50), Some(0), None);
+
+    let config = ManagerConfig {
+        versions: vec![RollupVersion {
+            rollup_binary: mock_rollup_binary(),
+            config_path: rollup_config,
+            migration_path: None,
+            start_height: None,
+            stop_height: Some(100),
+        }],
+    };
+
+    let result = run(&config, &[], 0, CheckpointConfig::Disabled);
+    let err = result.expect_err("runner should fail when the rollup exits below the stop height");
+    assert!(
+        matches!(err, RunnerError::PrematureExit { .. }),
+        "runner should return PrematureExit: {err:?}"
+    );
+}
+
 /// Returns the path to the rollup-manager binary, building it if necessary.
 fn manager_binary() -> PathBuf {
     static BINARY_PATH: OnceLock<PathBuf> = OnceLock::new();

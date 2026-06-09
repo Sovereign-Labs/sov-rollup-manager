@@ -1,17 +1,26 @@
+use std::io::ErrorKind;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use clap::Parser;
 use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
-use tiny_http::{Response, Server};
 use tracing::{error, info};
+use tungstenite::Message;
 
 use mock_rollup::{DEFAULT_IDLE_TIME_MS, RollupConfig, StateFile};
+
+/// Maximum time the slot-stream server waits for the manager to subscribe.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum time the main thread waits for the slot stream to be delivered
+/// before proceeding to (possibly immediately) exit.
+const FRAME_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "mock-rollup")]
@@ -36,6 +45,15 @@ fn signal_name(sig: i32) -> &'static str {
         SIGQUIT => "SIGQUIT",
         SIGHUP => "SIGHUP",
         _ => "UNKNOWN",
+    }
+}
+
+/// Drain any pending forwarded signals into `received`.
+fn drain_signals(signals: &mut Signals, received: &mut Vec<String>) {
+    for sig in signals.pending() {
+        let name = signal_name(sig);
+        info!(signal = name, "Received signal");
+        received.push(name.to_string());
     }
 }
 
@@ -114,55 +132,41 @@ fn run() -> Result<u8, String> {
         .map_err(|e| format!("failed to register signal handlers: {e}"))?;
     let mut received_signals: Vec<String> = Vec::new();
 
-    // Start HTTP server for height queries
+    // Start a WebSocket server that streams slots to the rollup manager, mirroring
+    // the Sovereign node's `/ledger/slots/latest/ws` head subscription.
     let bind_addr = format!("127.0.0.1:{}", config.runner.http_config.bind_port);
-    let server = Server::http(&bind_addr)
-        .map_err(|e| format!("failed to start HTTP server on {bind_addr}: {e}"))?;
-    info!(addr = %bind_addr, "HTTP server listening");
+    let listener =
+        TcpListener::bind(&bind_addr).map_err(|e| format!("failed to bind to {bind_addr}: {e}"))?;
+    info!(addr = %bind_addr, "Ledger WebSocket server listening");
 
-    // Shared state for the current height (used by HTTP handler)
-    let height = Arc::new(AtomicU64::new(current_height));
-
-    // Spawn HTTP handler thread
-    let http_height = Arc::clone(&height);
-    let _http_thread = thread::spawn(move || {
-        for request in server.incoming_requests() {
-            let url = request.url();
-            if url.starts_with("/modules/chain-state/state/current-heights") {
-                let h = http_height.load(Ordering::Relaxed);
-                // Response format: {"value": [rollup_height, visible_slot_number]}
-                let body = format!(r#"{{"value": [{h}, {h}]}}"#);
-                let response = Response::from_string(body)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    )
-                    .with_status_code(200);
-                let _ = request.respond(response);
-            } else {
-                let response = Response::from_string("Not Found").with_status_code(404);
-                let _ = request.respond(response);
-            }
-        }
+    let frames_sent = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = thread::spawn({
+        let frames_sent = Arc::clone(&frames_sent);
+        let stop = Arc::clone(&stop);
+        move || serve_slot_stream(listener, current_height, final_height, &frames_sent, &stop)
     });
 
-    // Simulate block processing - jump to final height immediately
-    height.store(final_height, Ordering::Relaxed);
-
-    // Idle for configured time while checking for signals
-    let idle_time = Duration::from_millis(config.idle_time_ms.unwrap_or(DEFAULT_IDLE_TIME_MS));
-    let start = Instant::now();
-
-    while start.elapsed() < idle_time {
-        // Check for signals
-        for sig in signals.pending() {
-            let name = signal_name(sig);
-            info!(signal = name, "Received signal");
-            received_signals.push(name.to_string());
-        }
+    // Ensure the final slot has been delivered (so we don't exit before the
+    // manager observes the height, even when idle time is zero), then idle for the
+    // configured time. Record any forwarded signals throughout.
+    let frames_deadline = Instant::now() + FRAME_DELIVERY_TIMEOUT;
+    while !frames_sent.load(Ordering::Acquire) && Instant::now() < frames_deadline {
+        drain_signals(&mut signals, &mut received_signals);
         thread::sleep(Duration::from_millis(10));
     }
+
+    let idle_time = Duration::from_millis(config.idle_time_ms.unwrap_or(DEFAULT_IDLE_TIME_MS));
+    let idle_deadline = Instant::now() + idle_time;
+    while Instant::now() < idle_deadline {
+        drain_signals(&mut signals, &mut received_signals);
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Drain any signals that arrived right at the end, then stop the server.
+    drain_signals(&mut signals, &mut received_signals);
+    stop.store(true, Ordering::Release);
+    let _ = server.join();
 
     // Update state with final height and received signals
     state.height = final_height;
@@ -183,6 +187,78 @@ fn run() -> Result<u8, String> {
     info!("Mock rollup shutting down gracefully");
 
     Ok(config.exit_code.unwrap_or(0))
+}
+
+/// Accept a single WebSocket subscriber and stream slot frames for heights
+/// `from + 1 ..= to`, matching the rollup's `/ledger/slots/latest/ws` head stream
+/// (each frame is `{"type":"slot","number":<height>}`). Sets `frames_sent` once
+/// the final slot has been flushed.
+fn serve_slot_stream(
+    listener: TcpListener,
+    from: u64,
+    to: u64,
+    frames_sent: &AtomicBool,
+    stop: &AtomicBool,
+) {
+    let Some(stream) = accept_with_timeout(&listener, stop) else {
+        return;
+    };
+
+    let mut socket = match tungstenite::accept(stream) {
+        Ok(socket) => socket,
+        Err(e) => {
+            error!(error = %e, "mock rollup: websocket handshake failed");
+            return;
+        }
+    };
+
+    for height in (from + 1)..=to {
+        let frame = format!(r#"{{"type":"slot","number":{height}}}"#);
+        if let Err(e) = socket.write(Message::Text(frame.into())) {
+            error!(error = %e, "mock rollup: failed to send slot frame");
+            return;
+        }
+    }
+    if let Err(e) = socket.flush() {
+        error!(error = %e, "mock rollup: failed to flush slot frames");
+        return;
+    }
+    frames_sent.store(true, Ordering::Release);
+
+    // Close gracefully so the subscriber sees all slots followed by a clean close.
+    // The buffered slots are delivered before the socket reports EOF.
+    let _ = socket.close(None);
+    let _ = socket.flush();
+}
+
+/// Accept one TCP connection, polling so we can bail out if `stop` is set or the
+/// manager never connects.
+fn accept_with_timeout(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("failed to set listener non-blocking");
+
+    let deadline = Instant::now() + ACCEPT_TIMEOUT;
+    loop {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("failed to set stream blocking");
+                return Some(stream);
+            }
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                error!(error = %e, "mock rollup: accept failed");
+                return None;
+            }
+        }
+    }
 }
 
 fn main() -> ExitCode {

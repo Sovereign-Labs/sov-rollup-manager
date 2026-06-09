@@ -10,19 +10,25 @@ use nix::unistd::Pid;
 use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointError, load_checkpoint, write_checkpoint,
 };
 use crate::config::{ManagerConfig, RollupVersion};
-use crate::rollup_api::{RollupApiClient, RollupApiError};
+use crate::rollup_api::{
+    HeightSubscription, RollupApiError, parse_http_port, spawn_height_subscription,
+};
 
-/// Interval between height polling attempts.
+/// Interval between monitor-loop iterations (signal forwarding, height and exit checks).
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Grace period for SIGTERM before escalating to SIGKILL.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum time to wait, after the rollup process exits, for the height
+/// subscription to drain any slots still buffered on the socket.
+const SUBSCRIPTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -301,8 +307,8 @@ fn run_version_with_monitoring(
 ) -> Result<(), RunnerError> {
     let binary_path = version.rollup_binary.to_str().unwrap();
 
-    // Create API client for height queries
-    let api_client = RollupApiClient::from_config(&version.config_path)?;
+    // Determine the rollup's HTTP port so we can subscribe to its height stream.
+    let port = parse_http_port(&version.config_path)?;
 
     // Register signal handlers for forwarding to child
     let mut signals = Signals::new([SIGTERM, SIGQUIT])?;
@@ -319,10 +325,15 @@ fn run_version_with_monitoring(
 
     info!(pid = child.id(), "Spawned rollup process");
 
+    // Subscribe to the rollup's ledger head stream to track its height. The
+    // subscription observes every committed slot, so the final height is seen
+    // reliably even when a fast resync exits within a single poll interval.
+    let subscription = spawn_height_subscription(port);
+
     // Run the monitoring loop
     let result = monitor_rollup(
         &mut child,
-        &api_client,
+        &subscription,
         &mut signals,
         version.stop_height,
         binary_path,
@@ -340,7 +351,7 @@ fn run_version_with_monitoring(
 /// Monitor a running rollup process, polling height and handling exit conditions.
 fn monitor_rollup(
     child: &mut Child,
-    api_client: &RollupApiClient,
+    subscription: &HeightSubscription,
     signals: &mut Signals,
     stop_height: Option<u64>,
     binary_path: &str,
@@ -363,38 +374,39 @@ fn monitor_rollup(
             }
         }
 
-        // Try to query height (may fail if API not ready or process crashed)
-        match api_client.query_rollup_height() {
-            Ok(height) => {
-                last_known_height = Some(height);
-                debug!(height, "Polled rollup height");
+        // Read the latest height observed over the subscription. `None` until
+        // the first slot arrives, which is expected during startup.
+        if let Some(height) = subscription.latest_height() {
+            last_known_height = Some(height);
 
-                // Check if exceeded stop height
-                if let Some(stop) = stop_height {
-                    if height > stop {
-                        error!(
-                            current_height = height,
-                            stop_height = stop,
-                            "Rollup exceeded configured stop height! Something is very wrong. Terminating rollup, manual intervention will be required for this upgrade."
-                        );
-                        terminate_process(child)?;
-                        return Err(RunnerError::ExceededStopHeight {
-                            current_height: height,
-                            stop_height: stop,
-                        });
-                    }
+            // Check if exceeded stop height
+            if let Some(stop) = stop_height {
+                if height > stop {
+                    error!(
+                        current_height = height,
+                        stop_height = stop,
+                        "Rollup exceeded configured stop height! Something is very wrong. Terminating rollup, manual intervention will be required for this upgrade."
+                    );
+                    terminate_process(child)?;
+                    return Err(RunnerError::ExceededStopHeight {
+                        current_height: height,
+                        stop_height: stop,
+                    });
                 }
-            }
-            Err(e) => {
-                // API not ready or request failed - this is expected during startup
-                // or on shutdown
-                warn!(error = %e, "Height query failed");
             }
         }
 
         // Check if process exited
         match child.try_wait() {
             Ok(Some(status)) => {
+                // The rollup exited. Give the subscription a moment to drain any
+                // slots still buffered on the socket so `last_known_height`
+                // reflects the true final height (the socket delivers all
+                // committed slots before reporting EOF).
+                subscription.wait_for_stream_end(SUBSCRIPTION_DRAIN_TIMEOUT);
+                if let Some(height) = subscription.latest_height() {
+                    last_known_height = Some(height);
+                }
                 return handle_process_exit(
                     status,
                     last_known_height,
