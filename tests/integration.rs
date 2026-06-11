@@ -686,6 +686,7 @@ fn test_checkpoint_enables_version_skip() {
     let checkpoint = Checkpoint {
         version_index: 1,
         binary_path: mock_rollup_binary(),
+        migration_completed: false,
     };
     write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
 
@@ -738,6 +739,7 @@ fn test_checkpoint_binary_mismatch_error() {
     let checkpoint = Checkpoint {
         version_index: 0,
         binary_path: PathBuf::from("/wrong/path/to/rollup"),
+        migration_completed: false,
     };
     write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
 
@@ -777,6 +779,7 @@ fn test_checkpoint_index_out_of_bounds_error() {
     let checkpoint = Checkpoint {
         version_index: 5, // Config only has 1 version
         binary_path: mock_rollup_binary(),
+        migration_completed: false,
     };
     write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
 
@@ -891,6 +894,7 @@ fn test_checkpoint_restart_from_intermediate_version() {
     let checkpoint = Checkpoint {
         version_index: 2,
         binary_path: mock_rollup_binary(),
+        migration_completed: false,
     };
     write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
 
@@ -911,4 +915,191 @@ fn test_checkpoint_restart_from_intermediate_version() {
     // Checkpoint should still be at v2
     let final_checkpoint = read_checkpoint(&checkpoint_file);
     assert_eq!(final_checkpoint.version_index, 2);
+}
+
+#[test]
+fn test_checkpoint_records_migration_completion() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+    let checkpoint_file = temp_dir.path().join("checkpoint.json");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+    let migration_path = write_state_version_migration_script(
+        &temp_dir,
+        "migrate_v0_to_v1",
+        &state_file,
+        0,
+        1,
+        &rollup_config_v1,
+    );
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(100),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: Some(migration_path),
+                start_height: Some(101),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    run(
+        &config,
+        &[],
+        0,
+        CheckpointConfig::Enabled {
+            path: checkpoint_file.clone(),
+        },
+    )
+    .expect("runner should succeed");
+
+    assert_eq!(read_state_height(&state_file), 200);
+    assert_eq!(read_state_version(&state_file), 1);
+
+    // Checkpoint should record that v1's migration has completed
+    let final_checkpoint = read_checkpoint(&checkpoint_file);
+    assert_eq!(final_checkpoint.version_index, 1);
+    assert!(final_checkpoint.migration_completed);
+}
+
+#[test]
+fn test_checkpoint_skips_completed_migration_on_restart() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+    let checkpoint_file = temp_dir.path().join("checkpoint.json");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+
+    // A migration that fails if invoked: it must NOT run, since the checkpoint
+    // records it as completed
+    let migration_path = write_failing_migration_script(&temp_dir, "must_not_run", 17);
+
+    // Simulate a restart after v1's migration ran but before v1 made progress
+    // (the mock rollup requires start_height == state height + 1, so the state
+    // must sit exactly at v0's stop height)
+    write_state_file_with_version(&state_file, 50, 1);
+    let checkpoint = Checkpoint {
+        version_index: 1,
+        binary_path: mock_rollup_binary(),
+        migration_completed: true,
+    };
+    write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(50),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: Some(migration_path),
+                start_height: Some(51),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    run(
+        &config,
+        &[],
+        0,
+        CheckpointConfig::Enabled {
+            path: checkpoint_file.clone(),
+        },
+    )
+    .expect("runner should succeed without re-running the migration");
+
+    assert_eq!(read_state_height(&state_file), 200);
+
+    // The migration should still be recorded as completed
+    let final_checkpoint = read_checkpoint(&checkpoint_file);
+    assert_eq!(final_checkpoint.version_index, 1);
+    assert!(final_checkpoint.migration_completed);
+}
+
+#[test]
+fn test_checkpoint_reruns_migration_when_not_completed() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let state_file = temp_dir.path().join("state");
+    let checkpoint_file = temp_dir.path().join("checkpoint.json");
+
+    let rollup_config_v0 =
+        write_rollup_config_ext(&temp_dir, "v0", &state_file, None, None, None, Some(0));
+    let rollup_config_v1 =
+        write_rollup_config_ext(&temp_dir, "v1", &state_file, None, None, None, Some(1));
+    let migration_path = write_state_version_migration_script(
+        &temp_dir,
+        "migrate_v0_to_v1",
+        &state_file,
+        0,
+        1,
+        &rollup_config_v1,
+    );
+
+    // Simulate a restart after v0 completed but before v1's migration ran
+    // (e.g. a crash during the migration)
+    write_state_file_with_version(&state_file, 100, 0);
+    let checkpoint = Checkpoint {
+        version_index: 1,
+        binary_path: mock_rollup_binary(),
+        migration_completed: false,
+    };
+    write_checkpoint(&checkpoint_file, &checkpoint).expect("failed to write checkpoint");
+
+    let config = ManagerConfig {
+        versions: vec![
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v0,
+                migration_path: None,
+                start_height: None,
+                stop_height: Some(100),
+            },
+            RollupVersion {
+                rollup_binary: mock_rollup_binary(),
+                config_path: rollup_config_v1,
+                migration_path: Some(migration_path),
+                start_height: Some(101),
+                stop_height: Some(200),
+            },
+        ],
+    };
+
+    run(
+        &config,
+        &[],
+        0,
+        CheckpointConfig::Enabled {
+            path: checkpoint_file.clone(),
+        },
+    )
+    .expect("runner should succeed");
+
+    // The migration must have run (it bumps state_version from 0 to 1)
+    assert_eq!(read_state_height(&state_file), 200);
+    assert_eq!(read_state_version(&state_file), 1);
+
+    let final_checkpoint = read_checkpoint(&checkpoint_file);
+    assert_eq!(final_checkpoint.version_index, 1);
+    assert!(final_checkpoint.migration_completed);
 }
