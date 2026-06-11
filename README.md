@@ -46,12 +46,12 @@ Where config.json is canonical to the chain being ran, and checkpoint.json is a 
 The rollup manager mostly transparently wraps the rollup process, and should work out of the box with any Sovereign SDK based rollup using normal configuration. This section documents in detail the manager <-> rollup communication in case this is of interest or to assist with particularly unusual configurations.
 
 ### Rollup HTTP config
-In order to detect when a rollup has reached the stop height, the manager queries the local node's HTTP API. This means the node must provide:
+In order to detect when a rollup has reached the stop height, the manager subscribes to the local node's HTTP API. This means the node must provide:
  * A `runner.http_config.bind_port` config value in the TOML file at `config_path`
 
 Additionally, for completeness, the manager relies on:
- * The rollup being available to being queried over `localhost:{bind_port}`
- * The `modules/chain-state/state/current-heights/` API endpoint
+ * The rollup being available over `localhost:{bind_port}`
+ * The `modules/chain-state/rollup-height/ws` WebSocket API endpoint
 Both of those should be available by default in any standard Sovereign SDK-based rollup. The ChainState endpoint is exposed by a core module that is always included in rollups that use the Sovereign SDK's module system.
 
 ### Process management

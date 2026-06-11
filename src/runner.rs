@@ -27,7 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum time to wait, after the rollup process exits, for the height
-/// subscription to drain any slots still buffered on the socket.
+/// subscription to drain any height updates still buffered on the socket.
 const SUBSCRIPTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
@@ -298,7 +298,7 @@ fn run_migration(path: &str, config_path: &Path) -> Result<(), RunnerError> {
 
 /// Run a rollup version with height monitoring.
 ///
-/// This spawns the rollup process and polls its height endpoint to ensure
+/// This spawns the rollup process and subscribes to its height stream to ensure
 /// it reaches the expected stop height before exiting.
 fn run_version_with_monitoring(
     version: &RollupVersion,
@@ -325,8 +325,8 @@ fn run_version_with_monitoring(
 
     info!(pid = child.id(), "Spawned rollup process");
 
-    // Subscribe to the rollup's ledger head stream to track its height. The
-    // subscription observes every committed slot, so the final height is seen
+    // Subscribe to the rollup's chain-state rollup-height stream. The
+    // subscription observes every committed rollup height, so the final height is seen
     // reliably even when a fast resync exits within a single poll interval.
     let subscription = spawn_height_subscription(port);
 
@@ -348,7 +348,7 @@ fn run_version_with_monitoring(
     result
 }
 
-/// Monitor a running rollup process, polling height and handling exit conditions.
+/// Monitor a running rollup process, reading subscribed heights and handling exit conditions.
 fn monitor_rollup(
     child: &mut Child,
     subscription: &HeightSubscription,
@@ -375,7 +375,7 @@ fn monitor_rollup(
         }
 
         // Read the latest height observed over the subscription. `None` until
-        // the first slot arrives, which is expected during startup.
+        // the first height arrives, which is expected during startup.
         if let Some(height) = subscription.latest_height() {
             last_known_height = Some(height);
 
@@ -400,9 +400,9 @@ fn monitor_rollup(
         match child.try_wait() {
             Ok(Some(status)) => {
                 // The rollup exited. Give the subscription a moment to drain any
-                // slots still buffered on the socket so `last_known_height`
+                // height updates still buffered on the socket so `last_known_height`
                 // reflects the true final height (the socket delivers all
-                // committed slots before reporting EOF).
+                // committed height updates before reporting EOF).
                 subscription.wait_for_stream_end(SUBSCRIPTION_DRAIN_TIMEOUT);
                 if let Some(height) = subscription.latest_height() {
                     last_known_height = Some(height);

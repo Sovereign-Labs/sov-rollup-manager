@@ -12,13 +12,18 @@ use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tracing::{error, info};
 use tungstenite::Message;
+use tungstenite::handshake::server::{ErrorResponse, Response};
+use tungstenite::http::StatusCode;
 
 use mock_rollup::{DEFAULT_IDLE_TIME_MS, RollupConfig, StateFile};
 
-/// Maximum time the slot-stream server waits for the manager to subscribe.
+/// Path of the chain-state rollup-height WebSocket subscription.
+const ROLLUP_HEIGHT_WS_PATH: &str = "/modules/chain-state/rollup-height/ws";
+
+/// Maximum time the rollup-height stream server waits for the manager to subscribe.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum time the main thread waits for the slot stream to be delivered
+/// Maximum time the main thread waits for the rollup-height stream to be delivered
 /// before proceeding to (possibly immediately) exit.
 const FRAME_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -132,22 +137,24 @@ fn run() -> Result<u8, String> {
         .map_err(|e| format!("failed to register signal handlers: {e}"))?;
     let mut received_signals: Vec<String> = Vec::new();
 
-    // Start a WebSocket server that streams slots to the rollup manager, mirroring
-    // the Sovereign node's `/ledger/slots/latest/ws` head subscription.
+    // Start a WebSocket server that streams rollup heights to the rollup manager,
+    // mirroring the Sovereign node's chain-state rollup-height subscription.
     let bind_addr = format!("127.0.0.1:{}", config.runner.http_config.bind_port);
     let listener =
         TcpListener::bind(&bind_addr).map_err(|e| format!("failed to bind to {bind_addr}: {e}"))?;
-    info!(addr = %bind_addr, "Ledger WebSocket server listening");
+    info!(addr = %bind_addr, "Rollup-height WebSocket server listening");
 
     let frames_sent = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let server = thread::spawn({
         let frames_sent = Arc::clone(&frames_sent);
         let stop = Arc::clone(&stop);
-        move || serve_slot_stream(listener, current_height, final_height, &frames_sent, &stop)
+        move || {
+            serve_rollup_height_stream(listener, current_height, final_height, &frames_sent, &stop)
+        }
     });
 
-    // Ensure the final slot has been delivered (so we don't exit before the
+    // Ensure the final height has been delivered (so we don't exit before the
     // manager observes the height, even when idle time is zero), then idle for the
     // configured time. Record any forwarded signals throughout.
     let frames_deadline = Instant::now() + FRAME_DELIVERY_TIMEOUT;
@@ -189,11 +196,12 @@ fn run() -> Result<u8, String> {
     Ok(config.exit_code.unwrap_or(0))
 }
 
-/// Accept a single WebSocket subscriber and stream slot frames for heights
-/// `from + 1 ..= to`, matching the rollup's `/ledger/slots/latest/ws` head stream
-/// (each frame is `{"type":"slot","number":<height>}`). Sets `frames_sent` once
-/// the final slot has been flushed.
-fn serve_slot_stream(
+/// Accept a single WebSocket subscriber and stream rollup-height frames, matching
+/// the SDK's `/modules/chain-state/rollup-height/ws` stream. The current height is
+/// sent immediately, followed by each subsequent height through `to`; each text
+/// frame is a bare JSON number. Sets `frames_sent` once the final height has been
+/// flushed.
+fn serve_rollup_height_stream(
     listener: TcpListener,
     from: u64,
     to: u64,
@@ -204,7 +212,7 @@ fn serve_slot_stream(
         return;
     };
 
-    let mut socket = match tungstenite::accept(stream) {
+    let mut socket = match tungstenite::accept_hdr(stream, validate_rollup_height_ws_path) {
         Ok(socket) => socket,
         Err(e) => {
             error!(error = %e, "mock rollup: websocket handshake failed");
@@ -212,23 +220,36 @@ fn serve_slot_stream(
         }
     };
 
-    for height in (from + 1)..=to {
-        let frame = format!(r#"{{"type":"slot","number":{height}}}"#);
+    for height in from..=to {
+        let frame = height.to_string();
         if let Err(e) = socket.write(Message::Text(frame.into())) {
-            error!(error = %e, "mock rollup: failed to send slot frame");
+            error!(error = %e, "mock rollup: failed to send rollup-height frame");
             return;
         }
     }
     if let Err(e) = socket.flush() {
-        error!(error = %e, "mock rollup: failed to flush slot frames");
+        error!(error = %e, "mock rollup: failed to flush rollup-height frames");
         return;
     }
     frames_sent.store(true, Ordering::Release);
 
-    // Close gracefully so the subscriber sees all slots followed by a clean close.
-    // The buffered slots are delivered before the socket reports EOF.
+    // Close gracefully so the subscriber sees all heights followed by a clean
+    // close. The buffered frames are delivered before the socket reports EOF.
     let _ = socket.close(None);
     let _ = socket.flush();
+}
+
+fn validate_rollup_height_ws_path(
+    request: &tungstenite::handshake::server::Request,
+    response: Response,
+) -> Result<Response, ErrorResponse> {
+    if request.uri().path() == ROLLUP_HEIGHT_WS_PATH {
+        Ok(response)
+    } else {
+        let mut response = ErrorResponse::new(Some("Not Found".to_string()));
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        Err(response)
+    }
 }
 
 /// Accept one TCP connection, polling so we can bail out if `stop` is set or the

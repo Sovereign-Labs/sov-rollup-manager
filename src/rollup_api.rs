@@ -120,30 +120,23 @@ pub fn parse_http_port(config_path: &Path) -> Result<u16, RollupApiError> {
     Ok(config.runner.http_config.bind_port)
 }
 
-/// Path of the ledger "latest slot" WebSocket subscription on the rollup's HTTP API.
-const LEDGER_HEAD_WS_PATH: &str = "/ledger/slots/latest/ws";
+/// Path of the chain-state rollup-height WebSocket subscription on the rollup's HTTP API.
+const ROLLUP_HEIGHT_WS_PATH: &str = "/modules/chain-state/rollup-height/ws";
 
 /// How long a subscription read blocks before returning so the worker can
-/// re-check its stop flag while no slots are arriving.
+/// re-check its stop flag while no height updates are arriving.
 const SUBSCRIPTION_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Delay between reconnection attempts while the rollup API is still starting up.
 const SUBSCRIPTION_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 
-/// Minimal view of a ledger `Slot` message. The slot `number` is the rollup
-/// height; all other fields are ignored.
-#[derive(Debug, Deserialize)]
-struct SlotHead {
-    number: u64,
-}
-
-/// A background subscription to the rollup's ledger head stream that tracks the
-/// latest committed rollup height.
+/// A background subscription to the rollup's chain-state rollup-height stream
+/// that tracks the latest committed rollup height.
 ///
 /// Unlike polling the height endpoint, a subscription receives *every* committed
-/// slot over a single TCP connection, so the final height before shutdown is
+/// rollup height over a single TCP connection, so the final height before shutdown is
 /// observed reliably even when the rollup resyncs and exits within a single poll
-/// interval (the kernel delivers all buffered slots before the socket reports EOF).
+/// interval (the kernel delivers all buffered frames before the socket reports EOF).
 pub struct HeightSubscription {
     latest_height: Arc<AtomicU64>,
     seen_any: Arc<AtomicBool>,
@@ -154,7 +147,7 @@ pub struct HeightSubscription {
 
 impl HeightSubscription {
     /// The latest rollup height observed over the subscription, or `None` if no
-    /// slot has been received yet.
+    /// height has been received yet.
     pub fn latest_height(&self) -> Option<u64> {
         if self.seen_any.load(Ordering::Acquire) {
             Some(self.latest_height.load(Ordering::Acquire))
@@ -169,7 +162,7 @@ impl HeightSubscription {
         self.stream_ended.load(Ordering::Acquire)
     }
 
-    /// Block until the stream ends (all buffered slots have been drained) or
+    /// Block until the stream ends (all buffered height updates have been drained) or
     /// `timeout` elapses. Call this once the rollup process has exited so that
     /// [`Self::latest_height`] reflects the true final height.
     pub fn wait_for_stream_end(&self, timeout: Duration) {
@@ -189,7 +182,7 @@ impl Drop for HeightSubscription {
     }
 }
 
-/// Spawn a background thread that subscribes to the rollup's ledger head stream
+/// Spawn a background thread that subscribes to the rollup-height stream
 /// on `port` and tracks the latest committed height.
 pub fn spawn_height_subscription(port: u16) -> HeightSubscription {
     let latest_height = Arc::new(AtomicU64::new(0));
@@ -197,7 +190,7 @@ pub fn spawn_height_subscription(port: u16) -> HeightSubscription {
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
 
-    let url = format!("ws://localhost:{port}{LEDGER_HEAD_WS_PATH}");
+    let url = format!("ws://localhost:{port}{ROLLUP_HEIGHT_WS_PATH}");
     let handle = thread::spawn({
         let latest_height = Arc::clone(&latest_height);
         let seen_any = Arc::clone(&seen_any);
@@ -215,7 +208,7 @@ pub fn spawn_height_subscription(port: u16) -> HeightSubscription {
     }
 }
 
-/// Connect to the ledger head stream and forward observed heights into the
+/// Connect to the rollup-height stream and forward observed heights into the
 /// shared atomics until the socket closes or `stop` is set.
 fn run_subscription(
     url: &str,
@@ -239,8 +232,8 @@ fn run_subscription(
         }
     };
 
-    // Use a read timeout so the worker can observe `stop` even when no slots are
-    // arriving.
+    // Use a read timeout so the worker can observe `stop` even when no height
+    // updates are arriving.
     if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
         let _ = tcp.set_read_timeout(Some(SUBSCRIPTION_READ_TIMEOUT));
     }
@@ -248,15 +241,12 @@ fn run_subscription(
     while !stop.load(Ordering::Acquire) {
         match socket.read() {
             Ok(Message::Text(text)) => {
-                if let Ok(slot) = serde_json::from_str::<SlotHead>(text.as_str()) {
-                    latest_height.store(slot.number, Ordering::Release);
+                if let Ok(height) = serde_json::from_str::<u64>(text.as_str()) {
+                    latest_height.store(height, Ordering::Release);
                     seen_any.store(true, Ordering::Release);
-                    debug!(
-                        height = slot.number,
-                        "Observed rollup height (subscription)"
-                    );
+                    debug!(height, "Observed rollup height (subscription)");
                 }
-                // Non-slot frames (e.g. server-side error messages) are ignored.
+                // Non-height frames (e.g. server-side error messages) are ignored.
             }
             Ok(Message::Close(_)) => break,
             // Ping/Pong are answered internally by tungstenite; ignore other frames.
@@ -267,7 +257,7 @@ fn run_subscription(
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) =>
             {
-                // Read timed out / was interrupted with no new slot: loop to
+                // Read timed out / was interrupted with no new height: loop to
                 // re-check `stop`.
             }
             // Any other error means the connection is gone (the rollup exited).
