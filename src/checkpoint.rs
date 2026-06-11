@@ -16,6 +16,14 @@ pub struct Checkpoint {
 
     /// Binary path of the version, used to validate config compatibility.
     pub binary_path: PathBuf,
+
+    /// Whether this version's migration has already completed, so restarts
+    /// don't re-run it. Always `false` for versions without a migration.
+    ///
+    /// Defaults to `false` when absent (checkpoint files written before this
+    /// field existed), which at worst re-runs an idempotent migration once.
+    #[serde(default)]
+    pub migration_completed: bool,
 }
 
 /// Configuration for checkpoint file usage.
@@ -86,6 +94,7 @@ mod tests {
         let checkpoint = Checkpoint {
             version_index: 2,
             binary_path: PathBuf::from("/usr/bin/rollup-v3"),
+            migration_completed: true,
         };
 
         write_checkpoint(&path, &checkpoint).unwrap();
@@ -93,6 +102,24 @@ mod tests {
 
         assert_eq!(loaded.version_index, 2);
         assert_eq!(loaded.binary_path, PathBuf::from("/usr/bin/rollup-v3"));
+        assert!(loaded.migration_completed);
+    }
+
+    #[test]
+    fn missing_migration_completed_defaults_to_false() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("checkpoint.json");
+
+        // Checkpoint file written before the migration_completed field existed
+        std::fs::write(
+            &path,
+            r#"{"version_index": 1, "binary_path": "/usr/bin/rollup-v2"}"#,
+        )
+        .unwrap();
+
+        let loaded = load_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(loaded.version_index, 1);
+        assert!(!loaded.migration_completed);
     }
 
     #[test]

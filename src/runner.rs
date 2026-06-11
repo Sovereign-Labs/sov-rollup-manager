@@ -135,7 +135,7 @@ pub fn run(
     let num_versions = config.versions.len();
 
     // Load and validate checkpoint if enabled
-    let start_index = match &checkpoint_config {
+    let (start_index, start_migration_completed) = match &checkpoint_config {
         CheckpointConfig::Enabled { path } => {
             match load_checkpoint(path).map_err(RunnerError::CheckpointRead)? {
                 Some(checkpoint) => {
@@ -160,19 +160,20 @@ pub fn run(
                     info!(
                         version_index = checkpoint.version_index,
                         binary = %checkpoint.binary_path.display(),
+                        migration_completed = checkpoint.migration_completed,
                         "Resuming from checkpoint"
                     );
-                    checkpoint.version_index
+                    (checkpoint.version_index, checkpoint.migration_completed)
                 }
                 None => {
                     info!("No checkpoint file found, starting from version 0");
-                    0
+                    (0, false)
                 }
             }
         }
         CheckpointConfig::Disabled => {
             info!("Checkpoint file disabled, starting from version 0");
-            0
+            (0, false)
         }
     };
 
@@ -189,11 +190,16 @@ pub fn run(
 
         let is_last = i == num_versions - 1;
 
+        // The migration is already done if we're resuming the checkpointed version
+        // and the checkpoint recorded its completion.
+        let migration_completed = i == start_index && start_migration_completed;
+
         // Write checkpoint before launching this version
         if let CheckpointConfig::Enabled { path } = &checkpoint_config {
             let checkpoint = Checkpoint {
                 version_index: i,
                 binary_path: version.rollup_binary.clone(),
+                migration_completed,
             };
             write_checkpoint(path, &checkpoint).map_err(RunnerError::CheckpointWrite)?;
             info!(
@@ -217,14 +223,36 @@ pub fn run(
             );
         }
 
-        // Run migration if specified
+        // Run migration if specified, unless the checkpoint recorded it as completed
         if let Some(ref migration_path) = version.migration_path {
-            info!(
-                migration = %migration_path.display(),
-                config = %version.config_path.display(),
-                "Running migration"
-            );
-            run_migration(migration_path.to_str().unwrap(), &version.config_path)?;
+            if migration_completed {
+                info!(
+                    migration = %migration_path.display(),
+                    "Skipping migration already completed according to checkpoint"
+                );
+            } else {
+                info!(
+                    migration = %migration_path.display(),
+                    config = %version.config_path.display(),
+                    "Running migration"
+                );
+                run_migration(migration_path.to_str().unwrap(), &version.config_path)?;
+
+                // Record completion so restarts don't re-run the migration
+                if let CheckpointConfig::Enabled { path } = &checkpoint_config {
+                    let checkpoint = Checkpoint {
+                        version_index: i,
+                        binary_path: version.rollup_binary.clone(),
+                        migration_completed: true,
+                    };
+                    write_checkpoint(path, &checkpoint).map_err(RunnerError::CheckpointWrite)?;
+                    info!(
+                        version = i,
+                        checkpoint_file = %path.display(),
+                        "Recorded migration completion in checkpoint file"
+                    );
+                }
+            }
         }
 
         // Build arguments for the rollup binary

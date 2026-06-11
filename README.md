@@ -30,6 +30,8 @@ Each version runs in sequence. The rollup manager thinly wraps the rollup node b
 ## Checkpoint file
 The rollup manager uses a checkpoint file to save the currently running version across restarts. *If and only if* the node state is wiped (triggering a full resync), then the checkpoint file should be deleted as well. Trying to run an empty state with a non-empty checkpoint or vice-versa will crash on startup if the versions don't match, but is not otherwise dangerous.
 
+The checkpoint file also records whether the current version's migration has completed, so that restarts of an already-migrated node don't re-run the migration. If the manager crashes or is killed while a migration is in progress, the migration will be re-run from scratch on the next startup; migrations are expected to be idempotent and, ideally, atomic.
+
 ### Rollup paths
 The checkpoint file is contains the path to the current version's binary for sanity checking. As such, when preparing for an upgrade, it is recommended to place the new version's binary will in a new location, rather than replacing the current latest version and moving the currently running version.
 
