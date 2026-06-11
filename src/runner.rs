@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -21,8 +21,50 @@ use crate::rollup_api::{RollupApiClient, RollupApiError};
 /// Interval between height polling attempts.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Time to wait before warning about continuous height query failures.
+const HEIGHT_QUERY_WARN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Minimum time between repeated height query warnings.
+const HEIGHT_QUERY_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Grace period for SIGTERM before escalating to SIGKILL.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeightQueryFailureLogLevel {
+    Debug,
+    Warn,
+}
+
+#[derive(Default)]
+struct HeightQueryFailureTracker {
+    failure_started_at: Option<Instant>,
+    last_warning_at: Option<Instant>,
+}
+
+impl HeightQueryFailureTracker {
+    fn record_success(&mut self) {
+        self.failure_started_at = None;
+        self.last_warning_at = None;
+    }
+
+    fn record_failure(&mut self, now: Instant) -> HeightQueryFailureLogLevel {
+        let failure_started_at = *self.failure_started_at.get_or_insert(now);
+
+        if now.duration_since(failure_started_at) < HEIGHT_QUERY_WARN_GRACE_PERIOD {
+            return HeightQueryFailureLogLevel::Debug;
+        }
+
+        if self.last_warning_at.is_none_or(|last_warning_at| {
+            now.duration_since(last_warning_at) >= HEIGHT_QUERY_WARN_INTERVAL
+        }) {
+            self.last_warning_at = Some(now);
+            HeightQueryFailureLogLevel::Warn
+        } else {
+            HeightQueryFailureLogLevel::Debug
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -347,6 +389,7 @@ fn monitor_rollup(
     height_slack: u64,
 ) -> Result<(), RunnerError> {
     let mut last_known_height: Option<u64> = None;
+    let mut height_query_failure_tracker = HeightQueryFailureTracker::default();
     let pid = Pid::from_raw(child.id() as i32);
 
     loop {
@@ -363,9 +406,11 @@ fn monitor_rollup(
             }
         }
 
-        // Try to query height (may fail if API not ready or process crashed)
+        // Try to query height (may fail if API is not ready or process is exiting).
+        let mut height_query_failure = None;
         match api_client.query_rollup_height() {
             Ok(height) => {
+                height_query_failure_tracker.record_success();
                 last_known_height = Some(height);
                 debug!(height, "Polled rollup height");
 
@@ -386,9 +431,7 @@ fn monitor_rollup(
                 }
             }
             Err(e) => {
-                // API not ready or request failed - this is expected during startup
-                // or on shutdown
-                warn!(error = %e, "Height query failed");
+                height_query_failure = Some(e);
             }
         }
 
@@ -404,7 +447,16 @@ fn monitor_rollup(
                 );
             }
             Ok(None) => {
-                // Process still running, continue monitoring
+                if let Some(e) = height_query_failure {
+                    match height_query_failure_tracker.record_failure(Instant::now()) {
+                        HeightQueryFailureLogLevel::Debug => {
+                            debug!(error = %e, "Height query failed");
+                        }
+                        HeightQueryFailureLogLevel::Warn => {
+                            warn!(error = %e, "Height query failed");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 return Err(RunnerError::Wait {
@@ -548,4 +600,101 @@ fn terminate_process(child: &mut Child) -> Result<(), RunnerError> {
 
     info!("Rollup process killed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_query_failure_tracker_debugs_before_grace_period() {
+        let mut tracker = HeightQueryFailureTracker::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            tracker.record_failure(start),
+            HeightQueryFailureLogLevel::Debug
+        );
+        assert_eq!(
+            tracker
+                .record_failure(start + HEIGHT_QUERY_WARN_GRACE_PERIOD - Duration::from_millis(1)),
+            HeightQueryFailureLogLevel::Debug
+        );
+    }
+
+    #[test]
+    fn height_query_failure_tracker_warns_after_grace_period() {
+        let mut tracker = HeightQueryFailureTracker::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            tracker.record_failure(start),
+            HeightQueryFailureLogLevel::Debug
+        );
+        assert_eq!(
+            tracker.record_failure(start + HEIGHT_QUERY_WARN_GRACE_PERIOD),
+            HeightQueryFailureLogLevel::Warn
+        );
+    }
+
+    #[test]
+    fn height_query_failure_tracker_rate_limits_warnings() {
+        let mut tracker = HeightQueryFailureTracker::default();
+        let start = Instant::now();
+        let first_warn_at = start + HEIGHT_QUERY_WARN_GRACE_PERIOD;
+
+        tracker.record_failure(start);
+        assert_eq!(
+            tracker.record_failure(first_warn_at),
+            HeightQueryFailureLogLevel::Warn
+        );
+        assert_eq!(
+            tracker.record_failure(
+                first_warn_at + HEIGHT_QUERY_WARN_INTERVAL - Duration::from_millis(1)
+            ),
+            HeightQueryFailureLogLevel::Debug
+        );
+    }
+
+    #[test]
+    fn height_query_failure_tracker_warns_after_rate_limit_interval() {
+        let mut tracker = HeightQueryFailureTracker::default();
+        let start = Instant::now();
+        let first_warn_at = start + HEIGHT_QUERY_WARN_GRACE_PERIOD;
+
+        tracker.record_failure(start);
+        assert_eq!(
+            tracker.record_failure(first_warn_at),
+            HeightQueryFailureLogLevel::Warn
+        );
+        assert_eq!(
+            tracker.record_failure(first_warn_at + HEIGHT_QUERY_WARN_INTERVAL),
+            HeightQueryFailureLogLevel::Warn
+        );
+    }
+
+    #[test]
+    fn height_query_failure_tracker_success_resets_warning_state() {
+        let mut tracker = HeightQueryFailureTracker::default();
+        let start = Instant::now();
+        let first_warn_at = start + HEIGHT_QUERY_WARN_GRACE_PERIOD;
+
+        tracker.record_failure(start);
+        assert_eq!(
+            tracker.record_failure(first_warn_at),
+            HeightQueryFailureLogLevel::Warn
+        );
+
+        tracker.record_success();
+
+        let restarted_at = first_warn_at + Duration::from_secs(1);
+        assert_eq!(
+            tracker.record_failure(restarted_at),
+            HeightQueryFailureLogLevel::Debug
+        );
+        assert_eq!(
+            tracker.record_failure(restarted_at + HEIGHT_QUERY_WARN_GRACE_PERIOD),
+            HeightQueryFailureLogLevel::Warn
+        );
+    }
 }
